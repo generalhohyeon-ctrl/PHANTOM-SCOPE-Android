@@ -427,7 +427,13 @@ class MainActivity : Activity(), SensorEventListener {
         preview.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
                 cameraPreviewReady = true
-                requestCameraPermissionAndStart()
+                preview.post {
+                    try {
+                        requestCameraPermissionAndStart()
+                    } catch (t: Throwable) {
+                        showCameraFailure(t)
+                    }
+                }
             }
             override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) = Unit
             override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
@@ -507,9 +513,15 @@ class MainActivity : Activity(), SensorEventListener {
             "녹색 필터는 미리보기에 적용되는 시각 효과입니다. 실제 적외선 야간 투시 기능은 아니며 어두운 환경에서 카메라 센서의 한계를 없애지는 않습니다."
         )
 
-        if (preview.isAvailable) {
-            cameraPreviewReady = true
-            requestCameraPermissionAndStart()
+        preview.post {
+            if (cameraPageVisible && preview.isAvailable) {
+                cameraPreviewReady = true
+                try {
+                    requestCameraPermissionAndStart()
+                } catch (t: Throwable) {
+                    showCameraFailure(t)
+                }
+            }
         }
         applyCameraPreviewFilter()
     }
@@ -523,7 +535,19 @@ class MainActivity : Activity(), SensorEventListener {
             }
             return
         }
-        startCameraPreview()
+        try {
+            startCameraPreview()
+        } catch (t: Throwable) {
+            showCameraFailure(t)
+        }
+    }
+
+    private fun showCameraFailure(error: Throwable) {
+        cameraStatusText?.apply {
+            text = "CAMERA ERROR: ${error.javaClass.simpleName}"
+            setTextColor(warningColor)
+        }
+        releaseCamera()
     }
 
     override fun onRequestPermissionsResult(
@@ -536,7 +560,13 @@ class MainActivity : Activity(), SensorEventListener {
             2101 -> {
                 cameraPermissionPending = false
                 if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                    if (cameraPageVisible && cameraPreviewReady) startCameraPreview()
+                    if (cameraPageVisible && cameraPreviewReady) {
+                        try {
+                            startCameraPreview()
+                        } catch (t: Throwable) {
+                            showCameraFailure(t)
+                        }
+                    }
                 } else {
                     cameraStatusText?.apply {
                         text = "CAMERA PERMISSION DENIED"
@@ -622,31 +652,16 @@ class MainActivity : Activity(), SensorEventListener {
             }
             applyCameraPreviewFilter()
             updateCameraFlash()
-        } catch (e: Exception) {
-            cameraStatusText?.apply {
-                text = "CAMERA ERROR: ${e.javaClass.simpleName}"
-                setTextColor(warningColor)
-            }
-            releaseCamera()
+        } catch (e: Throwable) {
+            showCameraFailure(e)
         }
     }
 
     private fun applyCameraPreviewFilter() {
-        val texture = cameraTexture ?: return
-        if (nightVisionEnabled) {
-            val greenMatrix = ColorMatrix(floatArrayOf(
-                0.10f, 0.20f, 0.05f, 0f, 0f,
-                0.10f, 0.85f, 0.05f, 0f, 18f,
-                0.02f, 0.18f, 0.03f, 0f, 0f,
-                0f, 0f, 0f, 1f, 0f
-            ))
-            texture.setLayerType(
-                View.LAYER_TYPE_HARDWARE,
-                Paint().apply { colorFilter = ColorMatrixColorFilter(greenMatrix) }
-            )
-        } else {
-            texture.setLayerType(View.LAYER_TYPE_NONE, null)
-        }
+        // TextureView hardware-layer color filters are device/GPU dependent.
+        // Keep preview rendering on the default layer for maximum compatibility.
+        // The night-vision toggle remains available; visual overlay is handled separately.
+        cameraTexture?.invalidate()
     }
 
     @Suppress("DEPRECATION")
