@@ -532,14 +532,29 @@ class MainActivity : Activity(), SensorEventListener {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 2101) {
-            cameraPermissionPending = false
-            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                if (cameraPageVisible && cameraPreviewReady) startCameraPreview()
-            } else {
-                cameraStatusText?.apply {
-                    text = "CAMERA PERMISSION DENIED"
-                    setTextColor(warningColor)
+        when (requestCode) {
+            2101 -> {
+                cameraPermissionPending = false
+                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    if (cameraPageVisible && cameraPreviewReady) startCameraPreview()
+                } else {
+                    cameraStatusText?.apply {
+                        text = "CAMERA PERMISSION DENIED"
+                        setTextColor(warningColor)
+                    }
+                }
+            }
+            501 -> {
+                if (grantResults.isNotEmpty() &&
+                    grantResults[0] == PackageManager.PERMISSION_GRANTED
+                ) {
+                    startAudioMonitoring()
+                } else {
+                    Toast.makeText(
+                        this,
+                        "소리 감지를 사용하려면 마이크 권한이 필요합니다.",
+                        Toast.LENGTH_LONG
+                    ).show()
                 }
             }
         }
@@ -905,27 +920,6 @@ class MainActivity : Activity(), SensorEventListener {
                 arrayOf(Manifest.permission.RECORD_AUDIO),
                 501
             )
-        }
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 501) {
-            if (grantResults.isNotEmpty() &&
-                grantResults[0] == PackageManager.PERMISSION_GRANTED
-            ) {
-                startAudioMonitoring()
-            } else {
-                Toast.makeText(
-                    this,
-                    "소리 감지를 사용하려면 마이크 권한이 필요합니다.",
-                    Toast.LENGTH_LONG
-                ).show()
-            }
         }
     }
 
