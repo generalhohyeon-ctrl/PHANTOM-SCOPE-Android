@@ -48,3 +48,9 @@ jobs:
           name: PHANTOM-SCOPE-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      - name: Validate Android Manifest
+        run: |
+          echo "Checking AndroidManifest.xml"
+          cat -A app/src/main/AndroidManifest.xml
+          xmllint --noout app/src/main/AndroidManifest.xml
