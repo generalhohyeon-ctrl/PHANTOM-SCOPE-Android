@@ -489,18 +489,12 @@ class RadarView(context: android.content.Context) : View(context) {
         val endX = cx + cos(sweepRadians).toFloat() * radius
         val endY = cy + sin(sweepRadians).toFloat() * radius
 
-        val sweepGradient = LinearGradient(
-            cx, cy, endX, endY,
-            Color.rgb(70, 220, 150),
-            Color.TRANSPARENT,
-            Shader.TileMode.CLAMP
-        )
+      sweepPaint.shader = null
+sweepPaint.alpha = 220
 
-        sweepPaint.shader = sweepGradient
-
-        canvas.drawLine(cx, cy, endX, endY, sweepPaint)
-
-        sweepPaint.shader = null
+canvas.drawLine(
+    cx, cy, endX, endY, sweepPaint
+)
 
         if (calibrated && deviation > 1.5f) {
             val blipRadius = radius *
@@ -541,8 +535,8 @@ class RadarView(context: android.content.Context) : View(context) {
         canvas.drawText("S", cx - 5f, cy + radius + 22f, textPaint)
         canvas.drawText("W", cx - radius - 20f, cy + 5f, textPaint)
 
-        sweepAngle = (sweepAngle + 2f) % 360f
+        sweepAngle = (sweepAngle + 3f) % 360f
 
-        postInvalidateDelayed(40)
-    }
+if (isAttachedToWindow) {
+    postInvalidateDelayed(100)
 }
