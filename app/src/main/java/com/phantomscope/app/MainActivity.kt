@@ -3,6 +3,10 @@ package com.phantomscope.app
 import android.app.Activity
 import android.Manifest
 import android.content.Context
+import android.content.ContentValues
+import android.net.Uri
+import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.content.pm.PackageManager
 import android.hardware.Camera
 import android.view.SurfaceHolder
@@ -838,24 +842,29 @@ class MainActivity : Activity(), SensorEventListener {
         try {
             active.takePicture(null, null) { bytes, sourceCamera ->
                 try {
-                    val folder = File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "PhantomScope")
-                    if (!folder.exists()) folder.mkdirs()
                     val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-                    val photo = File(folder, "PHANTOM_$stamp.jpg")
-                    FileOutputStream(photo).use { it.write(bytes) }
-                    attachEvidenceToLatestRecord(photo.absolutePath)
+                    val displayName = "PHANTOM_$stamp.jpg"
+                    val savedLocation = savePhotoToGallery(bytes, displayName)
+                    attachEvidenceToLatestRecord(savedLocation.first)
+
                     runOnUiThread {
                         cameraStatusText?.apply {
-                            text = "EVIDENCE SAVED: $stamp"
+                            text = "사진 저장 완료: Pictures/PHANTOM SCOPE/$displayName"
                             setTextColor(accentColor)
                         }
+                        Toast.makeText(
+                            this,
+                            "사진이 갤러리의 Pictures/PHANTOM SCOPE 폴더에 저장되었습니다.",
+                            Toast.LENGTH_LONG
+                        ).show()
                     }
-                } catch (_: Exception) {
+                } catch (error: Exception) {
                     runOnUiThread {
                         cameraStatusText?.apply {
-                            text = "PHOTO SAVE FAILED"
+                            text = "PHOTO SAVE FAILED: ${error.javaClass.simpleName}"
                             setTextColor(warningColor)
                         }
+                        Toast.makeText(this, "사진 저장 실패: ${error.message ?: "알 수 없는 오류"}", Toast.LENGTH_LONG).show()
                     }
                 } finally {
                     try {
@@ -864,12 +873,76 @@ class MainActivity : Activity(), SensorEventListener {
                     } catch (_: Exception) { }
                 }
             }
-        } catch (_: Exception) {
+        } catch (error: Exception) {
             cameraStatusText?.apply {
-                text = "PHOTO CAPTURE FAILED"
+                text = "PHOTO CAPTURE FAILED: ${error.javaClass.simpleName}"
                 setTextColor(warningColor)
             }
         }
+    }
+
+    /**
+     * Android 10+ saves into the public Pictures/PHANTOM SCOPE collection
+     * through MediaStore, so the image appears in Gallery/Google Photos.
+     * Older Android versions use the app-specific Pictures folder.
+     * Returns the persisted location and a short location label.
+     */
+    private fun savePhotoToGallery(bytes: ByteArray, displayName: String): Pair<String, String> {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                put(
+                    MediaStore.Images.Media.RELATIVE_PATH,
+                    Environment.DIRECTORY_PICTURES + "/PHANTOM SCOPE"
+                )
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                ?: throw java.io.IOException("MediaStore에 사진 항목을 만들지 못했습니다.")
+
+            try {
+                val output = contentResolver.openOutputStream(uri, "w")
+                    ?: throw java.io.IOException("사진 저장 스트림을 열지 못했습니다.")
+                output.use { it.write(bytes) }
+
+                val completed = ContentValues().apply {
+                    put(MediaStore.Images.Media.IS_PENDING, 0)
+                }
+                contentResolver.update(uri, completed, null, null)
+                return Pair(uri.toString(), "Pictures/PHANTOM SCOPE")
+            } catch (error: Exception) {
+                try { contentResolver.delete(uri, null, null) } catch (_: Exception) { }
+                throw error
+            }
+        }
+
+        val base = getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+            ?: throw java.io.IOException("사진 저장 폴더를 사용할 수 없습니다.")
+        val folder = File(base, "PhantomScope")
+        if (!folder.exists() && !folder.mkdirs()) {
+            throw java.io.IOException("사진 저장 폴더를 만들 수 없습니다.")
+        }
+        val photo = File(folder, displayName)
+        FileOutputStream(photo).use { it.write(bytes) }
+        return Pair(photo.absolutePath, "앱 전용 Pictures/PhantomScope")
+    }
+
+    private fun evidenceDisplayName(path: String): String {
+        if (path.startsWith("content://")) {
+            try {
+                contentResolver.query(Uri.parse(path), arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                    ?.use { cursor ->
+                        if (cursor.moveToFirst()) {
+                            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            if (index >= 0) return cursor.getString(index) ?: "증거 사진"
+                        }
+                    }
+            } catch (_: Exception) { }
+            return "증거 사진"
+        }
+        return File(path).name
     }
 
     @Suppress("DEPRECATION")
@@ -916,14 +989,25 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun openEvidence(path: String) {
-        val file = File(path)
-        if (!file.exists()) {
+        val isContentUri = path.startsWith("content://")
+        if (!isContentUri && !File(path).exists()) {
             Toast.makeText(this, "파일을 찾을 수 없습니다.", Toast.LENGTH_SHORT).show()
             return
         }
         if (path.lowercase(Locale.US).endsWith(".jpg") || path.lowercase(Locale.US).endsWith(".jpeg")) {
+            val bitmap = if (isContentUri) {
+                try {
+                    contentResolver.openInputStream(Uri.parse(path))?.use { BitmapFactory.decodeStream(it) }
+                } catch (_: Exception) { null }
+            } else {
+                BitmapFactory.decodeFile(path)
+            }
+            if (bitmap == null) {
+                Toast.makeText(this, "사진을 열 수 없습니다.", Toast.LENGTH_SHORT).show()
+                return
+            }
             val image = ImageView(this).apply {
-                setImageBitmap(BitmapFactory.decodeFile(path))
+                setImageBitmap(bitmap)
                 adjustViewBounds = true
                 scaleType = ImageView.ScaleType.FIT_CENTER
             }
@@ -1137,7 +1221,7 @@ class MainActivity : Activity(), SensorEventListener {
             eventsPanel.addView(audioTitle)
             savedAudioFiles.asReversed().take(10).forEach { path ->
                 val play = Button(this).apply {
-                    text = "▶ ${File(path).name}"
+                    text = "▶ ${evidenceDisplayName(path)}"
                     textSize = 10f
                     isAllCaps = false
                     setTextColor(Color.WHITE)
@@ -1659,7 +1743,7 @@ class MainActivity : Activity(), SensorEventListener {
 
             record.evidencePaths.forEach { path ->
                 val evidenceButton = Button(this).apply {
-                    val name = File(path).name
+                    val name = evidenceDisplayName(path)
                     text = if (name.endsWith(".jpg", true)) "📷 사진 열기: $name" else "▶ 녹음 재생: $name"
                     textSize = 10f
                     isAllCaps = false
