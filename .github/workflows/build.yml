@@ -34,15 +34,15 @@ jobs:
       - name: Extract 0.9.4 project
         run: |
           mkdir -p extracted
-          unzip -o PHANTOM_SCOPE_Android_0.9.4_recovery.zip -d extracted
+          unzip -o PHANTOM_SCOPE_0.6_GitHub_Ready.zip -d extracted
 
       - name: Build APK
         run: |
-          gradle -p extracted/PHANTOM_SCOPE_Android_0.9.4_recovery assembleDebug
+          gradle -p extracted/PHANTOM_SCOPE_0.6_GitHub_Ready.zip assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: phantom-scope-0.9.4-apk
-          path: extracted/PHANTOM_SCOPE_Android_0.9.4_recovery/app/build/outputs/apk/debug/app-debug.apk
+          path: extracted/PHANTOM_SCOPE_0.6_GitHub_Ready.zip/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
