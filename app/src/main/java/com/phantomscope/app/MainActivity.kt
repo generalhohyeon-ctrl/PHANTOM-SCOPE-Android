@@ -409,121 +409,35 @@ class MainActivity : Activity(), SensorEventListener {
 
 
     private fun showCameraPage() {
-        cameraPageVisible = true
+        // Diagnostic build: render a simple camera page without creating TextureView
+        // or opening the camera. This isolates whether the crash is caused by the
+        // camera preview lifecycle or by the tab/page UI itself.
+        cameraPageVisible = false
+        cameraPreviewReady = false
+        releaseCamera()
+
         addHeading("CAMERA SYSTEM")
         val panel = makePanel()
 
         val status = TextView(this).apply {
-            text = "CAMERA STANDBY"
-            textSize = 11f
+            text = "CAMERA DIAGNOSTIC MODE"
+            textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.LTGRAY)
+            setTextColor(accentColor)
         }
-        cameraStatusText = status
         panel.addView(status)
 
-        val preview = TextureView(this)
-        cameraTexture = preview
-        preview.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-            override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-                cameraPreviewReady = true
-                preview.post {
-                    try {
-                        requestCameraPermissionAndStart()
-                    } catch (t: Throwable) {
-                        showCameraFailure(t)
-                    }
-                }
-            }
-            override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) = Unit
-            override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
-                cameraPreviewReady = false
-                releaseCamera()
-                return true
-            }
-            override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+        val detail = TextView(this).apply {
+            text = "카메라 미리보기 기능을 일시적으로 분리했습니다. 이 화면에서 앱이 종료되지 않는지 확인해주세요."
+            textSize = 12f
+            setTextColor(Color.LTGRAY)
+            setPadding(0, dp(12), 0, dp(12))
         }
-        preview.setBackgroundColor(Color.BLACK)
-        panel.addView(preview, LinearLayout.LayoutParams(-1, dp(300)).apply {
-            setMargins(0, dp(12), 0, dp(12))
-        })
-
-        val modeRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
-        val modeButton = Button(this).apply {
-            text = if (nightVisionEnabled) "NIGHT VISION: ON" else "NORMAL VISION"
-            textSize = 10f
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            setOnClickListener {
-                nightVisionEnabled = !nightVisionEnabled
-                applyCameraPreviewFilter()
-                text = if (nightVisionEnabled) "NIGHT VISION: ON" else "NORMAL VISION"
-            }
-        }
-        val switchButton = Button(this).apply {
-            text = "전·후면 전환"
-            textSize = 10f
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            setOnClickListener {
-                useFrontCamera = !useFrontCamera
-                releaseCamera()
-                if (cameraPreviewReady) startCameraPreview()
-            }
-        }
-        modeRow.addView(modeButton, LinearLayout.LayoutParams(0, dp(44), 1f))
-        modeRow.addView(switchButton, LinearLayout.LayoutParams(0, dp(44), 1f))
-        panel.addView(modeRow)
-
-        val actionRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
-        val flashButton = Button(this).apply {
-            text = "플래시 OFF"
-            textSize = 10f
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            setOnClickListener {
-                flashEnabled = !flashEnabled
-                updateCameraFlash()
-                text = if (flashEnabled) "플래시 ON" else "플래시 OFF"
-            }
-        }
-        val captureButton = Button(this).apply {
-            text = "증거 사진 촬영"
-            textSize = 10f
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.rgb(30, 125, 85))
-            setOnClickListener { captureEvidencePhoto() }
-        }
-        actionRow.addView(flashButton, LinearLayout.LayoutParams(0, dp(46), 1f))
-        actionRow.addView(captureButton, LinearLayout.LayoutParams(0, dp(46), 1f))
-        panel.addView(actionRow)
+        panel.addView(detail)
 
         content.addView(panel, LinearLayout.LayoutParams(-1, -2).apply {
             setMargins(0, 0, 0, dp(12))
         })
-        addPanelText(
-            "NIGHT VISION MODE",
-            "녹색 필터는 미리보기에 적용되는 시각 효과입니다. 실제 적외선 야간 투시 기능은 아니며 어두운 환경에서 카메라 센서의 한계를 없애지는 않습니다."
-        )
-
-        preview.post {
-            if (cameraPageVisible && preview.isAvailable) {
-                cameraPreviewReady = true
-                try {
-                    requestCameraPermissionAndStart()
-                } catch (t: Throwable) {
-                    showCameraFailure(t)
-                }
-            }
-        }
-        applyCameraPreviewFilter()
     }
 
     private fun requestCameraPermissionAndStart() {
