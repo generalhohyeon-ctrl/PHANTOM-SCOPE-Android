@@ -31,15 +31,28 @@ jobs:
       - name: Install Android SDK
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
+      - name: Extract Android project
+        run: |
+          find "$GITHUB_WORKSPACE" -type f -name '*.zip' \
+            -not -path '*/.git/*' \
+            -exec unzip -o {} -d "$GITHUB_WORKSPACE/extracted" \;
+
       - name: Find Android project
         run: |
-          PROJECT_DIR=$(find "$GITHUB_WORKSPACE" -name settings.gradle.kts -not -path '*/.gradle/*' -printf '%h\n' | head -n 1)
+          PROJECT_DIR=$(find "$GITHUB_WORKSPACE" \
+            -type f \( -name settings.gradle.kts -o -name settings.gradle \) \
+            -not -path '*/.gradle/*' \
+            -not -path '*/.git/*' \
+            -printf '%h\n' | head -n 1)
+
           if [ -z "$PROJECT_DIR" ]; then
             echo "Android project not found!"
+            find "$GITHUB_WORKSPACE" -maxdepth 4 -type f | head -100
             exit 1
           fi
+
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Found project: $PROJECT_DIR"
+          echo "Found: $PROJECT_DIR"
 
       - name: Build APK
         run: gradle -p "$PROJECT_DIR" assembleDebug
