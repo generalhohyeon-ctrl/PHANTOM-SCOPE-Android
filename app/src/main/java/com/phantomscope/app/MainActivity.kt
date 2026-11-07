@@ -80,6 +80,9 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var minimumText: TextView
 
     private val spectrumSegments = mutableListOf<View>()
+    private val spectrumSamples = ArrayDeque<Float>()
+    private var smoothedSpectrumValue = 0f
+    private var lastSpectrumLevel = 0
     private val readings = mutableListOf<Float>()
     private lateinit var logPreferences: SharedPreferences
     private val investigationRecords = mutableListOf<InvestigationRecord>()
@@ -167,9 +170,7 @@ class MainActivity : Activity(), SensorEventListener {
         }
 
         root.addView(subtitle)
-        root.addView(createSpectrum())
-
-        val tabNames = listOf("레이더", "사운드", "카메라", "기록")
+        val tabNames = listOf("레이더", "사운드", "카메라", "상점")
 
         val tabRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -221,12 +222,9 @@ class MainActivity : Activity(), SensorEventListener {
             Sensor.TYPE_MAGNETIC_FIELD
         )
 
-        if (magneticSensor == null) {
-            fieldValueText.text = "-- μT"
+        if (magneticSensor == null && ::sensorStatusText.isInitialized) {
             sensorStatusText.text = "MAGNETIC SENSOR NOT SUPPORTED"
             sensorStatusText.setTextColor(warningColor)
-        } else {
-            sensorStatusText.text = "SENSOR READY - WAITING"
         }
 
         logPreferences = getSharedPreferences("phantom_scope_logs", MODE_PRIVATE)
@@ -241,63 +239,62 @@ class MainActivity : Activity(), SensorEventListener {
         val panel = makePanel()
 
         val label = TextView(this).apply {
-            text = "REAL MAGNETIC FIELD SPECTRUM"
-            textSize = 11f
+            text = "EMF SIGNAL STRENGTH"
+            textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
-            letterSpacing = 1f
+            letterSpacing = 1.2f
             setTextColor(Color.LTGRAY)
         }
-
         panel.addView(label)
 
+        // 숫자 대신 색상 LED만으로 강도를 표시합니다.
         fieldValueText = TextView(this).apply {
-            text = "-- μT"
-            textSize = 28f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(accentColor)
-            setPadding(0, dp(8), 0, dp(5))
+            visibility = View.GONE
         }
-
-        panel.addView(fieldValueText)
 
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dp(8), 0, dp(8))
+            gravity = Gravity.CENTER
+            setPadding(0, dp(16), 0, dp(12))
         }
 
-        val colors = listOf(
-            Color.rgb(40, 210, 120),
-            Color.rgb(230, 210, 50),
-            Color.rgb(255, 150, 35),
-            Color.rgb(230, 45, 55)
-        )
-
-        colors.forEach { color ->
+        spectrumSegments.clear()
+        for (index in 0 until 12) {
+            val hue = when (index) {
+                in 0..3 -> 120f - index * 20f       // green -> yellow
+                in 4..7 -> 60f - (index - 3) * 15f // yellow -> red
+                else -> 300f - (index - 7) * 5f    // red -> violet
+            }
+            val color = Color.HSVToColor(floatArrayOf(hue.coerceAtLeast(0f), 0.9f, 1f))
             val segment = View(this).apply {
                 background = roundedBackground(color, 5)
-                alpha = 0.25f
+                alpha = 0.22f
             }
-
             spectrumSegments.add(segment)
-
-            bar.addView(
-                segment,
-                LinearLayout.LayoutParams(0, dp(12), 1f).apply {
-                    setMargins(dp(3), 0, dp(3), 0)
-                }
-            )
+            bar.addView(segment, LinearLayout.LayoutParams(0, dp(28), 1f).apply {
+                setMargins(dp(2), 0, dp(2), 0)
+            })
         }
-
         panel.addView(bar)
 
         sensorStatusText = TextView(this).apply {
-            text = "SENSOR INITIALIZING"
-            textSize = 10f
-            setTextColor(Color.LTGRAY)
+            text = if (magneticSensor == null) "MAGNETIC SENSOR NOT SUPPORTED" else "SENSOR CALIBRATING"
+            textSize = 11f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(if (magneticSensor == null) warningColor else accentColor)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(3), 0, 0)
         }
-
         panel.addView(sensorStatusText)
 
+        val legend = TextView(this).apply {
+            text = "LOW                                      HIGH"
+            textSize = 9f
+            setTextColor(Color.GRAY)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(8), 0, 0)
+        }
+        panel.addView(legend)
         return panel
     }
 
@@ -372,35 +369,45 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun updateSpectrum(value: Float) {
-        fieldValueText.text = String.format(
-            Locale.US, "%.1f μT", value
-        )
+        // 최근 센서값을 평균 내어 색상 단계가 너무 빠르게 흔들리지 않도록 합니다.
+        spectrumSamples.addLast(value)
+        while (spectrumSamples.size > 12) spectrumSamples.removeFirst()
+        smoothedSpectrumValue = spectrumSamples.average().toFloat()
 
-        val level = when {
-            value < 50f -> 0
-            value < 70f -> 1
-            value < 100f -> 2
-            else -> 3
+        // 기존 기기의 일반적인 자기장 범위(약 25~120 μT)를 12단계 LED로 표시합니다.
+        val normalized = ((smoothedSpectrumValue - 25f) / 95f).coerceIn(0f, 1f)
+        val targetLevel = (normalized * 12f).roundToInt().coerceIn(0, 12)
+
+        // 작은 흔들림은 무시해 표시가 깜빡이지 않도록 히스테리시스를 적용합니다.
+        if (targetLevel > lastSpectrumLevel) {
+            if (normalized * 12f >= lastSpectrumLevel + 0.65f) lastSpectrumLevel = targetLevel
+        } else if (targetLevel < lastSpectrumLevel) {
+            if (normalized * 12f <= lastSpectrumLevel - 0.85f) lastSpectrumLevel = targetLevel
         }
-
-        val labels = listOf(
-            "NORMAL", "ELEVATED", "HIGH", "CRITICAL"
-        )
-
-        val colors = listOf(
-            Color.rgb(40, 210, 120),
-            Color.rgb(230, 210, 50),
-            Color.rgb(255, 150, 35),
-            Color.rgb(230, 45, 55)
-        )
 
         spectrumSegments.forEachIndexed { index, segment ->
-            segment.alpha = if (index == level) 1f else 0.25f
+            segment.alpha = if (index < lastSpectrumLevel) 1f else 0.18f
         }
 
-        fieldValueText.setTextColor(colors[level])
-        sensorStatusText.text = "LIVE SENSOR  |  ${labels[level]}"
-        sensorStatusText.setTextColor(colors[level])
+        val status = when {
+            magneticSensor == null -> "SENSOR UNAVAILABLE"
+            baselineCount < 30 -> "CALIBRATING SENSOR"
+            lastSpectrumLevel <= 3 -> "LOW FIELD"
+            lastSpectrumLevel <= 6 -> "MODERATE FIELD"
+            lastSpectrumLevel <= 9 -> "HIGH FIELD"
+            else -> "EXTREME FIELD"
+        }
+        if (::sensorStatusText.isInitialized) {
+            sensorStatusText.text = status
+            sensorStatusText.setTextColor(
+                when {
+                    lastSpectrumLevel <= 3 -> Color.rgb(70, 220, 130)
+                    lastSpectrumLevel <= 6 -> Color.rgb(220, 220, 65)
+                    lastSpectrumLevel <= 9 -> Color.rgb(255, 145, 45)
+                    else -> Color.rgb(220, 65, 170)
+                }
+            )
+        }
     }
 
     private fun updateStatistics() {
@@ -447,7 +454,7 @@ class MainActivity : Activity(), SensorEventListener {
             0 -> showRadarPage()
             1 -> showAudioPage()
             2 -> showCameraPage()
-            3 -> showInvestigationLogPage()
+            3 -> showStorePage()
         }
     }
 
@@ -1864,46 +1871,96 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun showRadarPage() {
-        addHeading("RADAR SYSTEM")
+        addHeading("EMF RADAR")
+
+        val spectrumPanel = createSpectrum()
+        content.addView(spectrumPanel, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(0, dp(2), 0, dp(12))
+        })
 
         radarView = RadarView(this)
+        content.addView(radarView, LinearLayout.LayoutParams(-1, dp(300)).apply {
+            setMargins(0, 0, 0, dp(12))
+        })
 
-        content.addView(
-            radarView,
-            LinearLayout.LayoutParams(-1, dp(300)).apply {
-                setMargins(0, dp(4), 0, dp(12))
-            }
-        )
-
-        radarView.setCalibration(
-            baselineCount.toFloat() / 30f
-        )
-
+        radarView.setCalibration(baselineCount.toFloat() / 30f)
         if (baselineCount >= 30) {
             val deviation = abs(currentValue - baseline)
             radarView.updateData(deviation, 0f, 0f)
         }
 
-        addHeading("FIELD ANALYSIS")
-
-        graphView = FieldGraphView(this)
-        graphView.setReadings(readings.toList())
-
-        content.addView(
-            graphView,
-            LinearLayout.LayoutParams(-1, dp(180)).apply {
-                setMargins(0, 0, 0, dp(12))
-            }
-        )
-
-        addStatisticsPanel()
-
         addPanelText(
-            "SENSOR INFORMATION",
-            "실제 휴대폰 자기장 센서 측정값입니다.\n\n" +
-            "초기 30회 측정값을 기준으로 변화량을 계산합니다.\n\n" +
-            "금속, 자석, 전자기기 및 주변 환경이 측정값에 영향을 줄 수 있습니다."
+            "COLOR EMF METER",
+            "자기장 센서의 측정 강도를 색상으로 표시합니다. 숫자는 표시하지 않으며, 최근 측정값을 부드럽게 평균 내어 색상 변화가 급격하게 흔들리지 않도록 했습니다.\\n\\n" +
+                "초록은 낮은 강도, 노랑은 중간 강도, 주황과 빨강은 높은 강도, 보라색은 매우 높은 강도를 나타냅니다.\\n\\n" +
+                "이 기능은 휴대폰 자기장 센서의 변화 표시이며, 초자연 현상이나 유령의 존재를 판별하는 장치는 아닙니다."
         )
+    }
+
+    private fun showStorePage() {
+        addHeading("PHANTOM STORE")
+        addPanelText(
+            "SUPPORT THE PROJECT",
+            "PHANTOM SCOPE의 개발과 업데이트를 응원해 주세요.\\n\\n후원 기능은 추후 결제 시스템 연결 후 제공됩니다."
+        )
+        addStoreItem(
+            "개발자 후원",
+            "앱의 지속적인 개발을 응원합니다.",
+            "♡"
+        )
+        addStoreItem(
+            "광고 제거",
+            "광고 없이 쾌적하게 이용할 수 있는 옵션입니다.",
+            "★"
+        )
+        addStoreItem(
+            "프리미엄 기능",
+            "추가 테마와 고급 기능을 준비하고 있습니다.",
+            "✦"
+        )
+        addPanelText(
+            "COMING SOON",
+            "현재 상점은 메뉴 미리보기입니다. 후원 및 광고 제거 결제는 아직 연결되어 있지 않습니다."
+        )
+    }
+
+    private fun addStoreItem(title: String, description: String, symbol: String) {
+        val panel = makePanel()
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val icon = TextView(this).apply {
+            text = symbol
+            textSize = 28f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(accentColor)
+            gravity = Gravity.CENTER
+        }
+        row.addView(icon, LinearLayout.LayoutParams(dp(48), dp(48)))
+        val textColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(10), 0, 0, 0)
+        }
+        val titleView = TextView(this).apply {
+            text = title
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        }
+        val descriptionView = TextView(this).apply {
+            text = description
+            textSize = 11f
+            setTextColor(Color.LTGRAY)
+            setPadding(0, dp(4), 0, 0)
+        }
+        textColumn.addView(titleView)
+        textColumn.addView(descriptionView)
+        row.addView(textColumn, LinearLayout.LayoutParams(0, -2, 1f))
+        panel.addView(row)
+        content.addView(panel, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(0, 0, 0, dp(10))
+        })
     }
 
     private fun addStatisticsPanel() {
@@ -2219,13 +2276,14 @@ class RadarView(context: android.content.Context) : View(context) {
         textPaint.textAlign = Paint.Align.CENTER
 
         val status = if (calibrated) {
-            String.format(
-                Locale.US,
-                "FIELD CHANGE: %.1f μT",
-                deviation
-            )
+            when {
+                deviation < 1.5f -> "SIGNAL: LOW"
+                deviation < 5f -> "SIGNAL: MODERATE"
+                deviation < 10f -> "SIGNAL: HIGH"
+                else -> "SIGNAL: VERY HIGH"
+            }
         } else {
-            "CALIBRATING ${(calibrationProgress * 100).toInt()}%"
+            "CALIBRATING SENSOR"
         }
 
         canvas.drawText(
