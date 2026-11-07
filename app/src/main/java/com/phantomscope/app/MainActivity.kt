@@ -537,6 +537,8 @@ canvas.drawLine(
 
         sweepAngle = (sweepAngle + 3f) % 360f
 
-if (isAttachedToWindow) {
-    postInvalidateDelayed(100)
+ if (isAttachedToWindow) {
+            postInvalidateDelayed(100)
+        }
+    }
 }
