@@ -239,7 +239,12 @@ class MainActivity : Activity(), SensorEventListener {
             radarView.updateData(deviation, x, y)
         }
     }
-
+override fun onAccuracyChanged(
+        sensor: Sensor?,
+        accuracy: Int
+    ) {
+        // 센서 정확도 변경 시 별도 처리 없음
+    }
     private fun updateSpectrum(value: Float) {
         fieldValueText.text = String.format(
             Locale.US, "%.1f μT", value
