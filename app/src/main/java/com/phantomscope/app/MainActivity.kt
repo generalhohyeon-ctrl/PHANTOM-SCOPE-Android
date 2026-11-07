@@ -565,7 +565,7 @@ class RadarView(context: android.content.Context) : View(context) {
         )
 
         // 다음 화면 갱신
-        sweepAngle = (sweepAngle + 3f) % 360f
+        sweepAngle = (sweepAngle + 1.5f) % 360f
 
         if (isAttachedToWindow) {
             postInvalidateDelayed(100)
