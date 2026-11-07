@@ -1,1 +1,12 @@
+<resources>
 
+    <style name="PhantomScopeTheme"
+        parent="@android:style/Theme.Material.NoActionBar">
+
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowBackground">@drawable/phantom_splash</item>
+        <item name="android:windowActionModeOverlay">true</item>
+
+    </style>
+
+</resources>
