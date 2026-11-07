@@ -1,10 +1,10 @@
+
 name: Build PHANTOM SCOPE APK
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 jobs:
   build:
@@ -20,6 +20,9 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
@@ -28,18 +31,22 @@ jobs:
       - name: Install Android SDK
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
-      - name: Extract Android project
-        run: unzip -q PHANTOM_SCOPE_Android_0.9.4_recovery.zip -d source
+      - name: Find Android project
+        run: |
+          PROJECT_DIR=$(find "$GITHUB_WORKSPACE" -name settings.gradle.kts -not -path '*/.gradle/*' -printf '%h\n' | head -n 1)
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "Android project not found!"
+            exit 1
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Found project: $PROJECT_DIR"
 
       - name: Build APK
-        uses: gradle/gradle-build-action@v3
-        with:
-          gradle-version: '8.9'
-          arguments: assembleDebug
-          build-root-directory: source/PHANTOM_SCOPE_Android
+        run: gradle -p "$PROJECT_DIR" assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: PHANTOM-SCOPE-APK
-          path: source/PHANTOM_SCOPE_Android/app/build/outputs/apk/debug/app-debug.apk
+          name: phantom-scope-debug-apk
+          path: '**/app/build/outputs/apk/debug/app-debug.apk'
+          if-no-files-found: error
