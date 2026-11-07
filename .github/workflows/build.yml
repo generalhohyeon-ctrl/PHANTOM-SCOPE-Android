@@ -29,7 +29,7 @@ jobs:
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
       - name: Extract Android project
-        run: unzip -q PHANTOM_SCOPE_Android_0.9.2_radar_photo.zip -d source
+        run: unzip -q PHANTOM_SCOPE_Android_0.9.3_black_screen_recovery.zip -d source
 
       - name: Build APK
         uses: gradle/gradle-build-action@v3
