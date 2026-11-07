@@ -39,6 +39,18 @@ jobs:
         run: |
           sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
+      - name: Install XML validation tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxml2-utils
+
+      - name: Validate Android Manifest
+        run: |
+          echo "Checking AndroidManifest.xml"
+          cat -n app/src/main/AndroidManifest.xml
+          xmllint --noout app/src/main/AndroidManifest.xml
+          echo "XML validation successful"
+
       - name: Build APK
         run: gradle --no-daemon assembleDebug
 
@@ -48,9 +60,3 @@ jobs:
           name: PHANTOM-SCOPE-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
-
-      - name: Validate Android Manifest
-        run: |
-          echo "Checking AndroidManifest.xml"
-          cat -A app/src/main/AndroidManifest.xml
-          xmllint --noout app/src/main/AndroidManifest.xml
