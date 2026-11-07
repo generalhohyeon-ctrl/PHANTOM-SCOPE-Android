@@ -63,6 +63,8 @@ class MainActivity : Activity(), SensorEventListener {
 
     private lateinit var content: LinearLayout
     private lateinit var tabButtons: List<Button>
+    private var mainRootView: View? = null
+    private var cameraFullscreen = false
 
     private lateinit var sensorManager: SensorManager
     private var magneticSensor: Sensor? = null
@@ -209,6 +211,7 @@ class MainActivity : Activity(), SensorEventListener {
             LinearLayout.LayoutParams(-1, 0, 1f)
         )
 
+        mainRootView = root
         setContentView(root)
 
         sensorManager = getSystemService(SENSOR_SERVICE)
@@ -423,15 +426,21 @@ class MainActivity : Activity(), SensorEventListener {
         if (index != 2) {
             cameraPageVisible = false
             releaseCamera()
+            closePoseDetector()
+            if (cameraFullscreen) {
+                cameraFullscreen = false
+                setContentView(mainRootView)
+                window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN)
+                window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
+            }
         }
         content.removeAllViews()
 
-        tabButtons.forEachIndexed { i, button ->
-            button.setBackgroundColor(
-                if (i == index) warningColor else panelColor
-            )
-
-            button.setTextColor(Color.WHITE)
+        if (!cameraFullscreen) {
+            tabButtons.forEachIndexed { i, button ->
+                button.setBackgroundColor(if (i == index) warningColor else panelColor)
+                button.setTextColor(Color.WHITE)
+            }
         }
 
         when (index) {
@@ -446,19 +455,14 @@ class MainActivity : Activity(), SensorEventListener {
     private fun showCameraPage() {
         cameraPageVisible = true
         cameraPreviewReady = false
-        addHeading("CAMERA SYSTEM")
-        val panel = makePanel()
+        cameraFullscreen = true
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN)
+        window.decorView.systemUiVisibility =
+            View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+            View.SYSTEM_UI_FLAG_FULLSCREEN
 
-        val status = TextView(this).apply {
-            text = "CAMERA STANDBY"
-            textSize = 11f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.LTGRAY)
-        }
-        cameraStatusText = status
-        panel.addView(status)
-
-        // Use SurfaceView rather than TextureView for the legacy Camera preview.
+        val cameraRoot = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         val previewFrame = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         val surfaceView = SurfaceView(this)
         cameraSurfaceView = surfaceView
@@ -469,11 +473,8 @@ class MainActivity : Activity(), SensorEventListener {
                 cameraPreviewReady = true
                 surfaceView.post {
                     if (cameraPageVisible) {
-                        try {
-                            requestCameraPermissionAndStart()
-                        } catch (t: Throwable) {
-                            showCameraFailure(t)
-                        }
+                        try { requestCameraPermissionAndStart() }
+                        catch (t: Throwable) { showCameraFailure(t) }
                     }
                 }
             }
@@ -485,9 +486,8 @@ class MainActivity : Activity(), SensorEventListener {
                         camera?.stopPreview()
                         camera?.setPreviewDisplay(holder)
                         camera?.startPreview()
-                    } catch (t: Throwable) {
-                        showCameraFailure(t)
-                    }
+                        attachPosePreviewCallback(camera!!)
+                    } catch (t: Throwable) { showCameraFailure(t) }
                 }
             }
 
@@ -511,24 +511,51 @@ class MainActivity : Activity(), SensorEventListener {
         val poseView = PoseOverlayView(this)
         poseOverlay = poseView
         previewFrame.addView(poseView, FrameLayout.LayoutParams(-1, -1))
+        cameraRoot.addView(previewFrame, FrameLayout.LayoutParams(-1, -1))
 
-        panel.addView(previewFrame, LinearLayout.LayoutParams(-1, dp(300)).apply {
-            setMargins(0, dp(12), 0, dp(12))
-        })
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setBackgroundColor(Color.argb(150, 5, 10, 14))
+        }
+        val status = TextView(this).apply {
+            text = "CAMERA STANDBY"
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(accentColor)
+        }
+        cameraStatusText = status
+        topBar.addView(status, LinearLayout.LayoutParams(0, -2, 1f))
+        val exitButton = Button(this).apply {
+            text = "나가기 ✕"
+            textSize = 12f
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            setBackgroundColor(warningColor)
+            setOnClickListener { showPage(0) }
+        }
+        topBar.addView(exitButton, LinearLayout.LayoutParams(dp(92), dp(44)))
+        cameraRoot.addView(topBar, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
 
-        val modeRow = LinearLayout(this).apply {
+        val controls = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(10), dp(8), dp(10), dp(10))
+            setBackgroundColor(Color.argb(175, 5, 10, 14))
+        }
+        val firstRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
         val modeButton = Button(this).apply {
-            text = if (nightVisionEnabled) "NIGHT VISION: ON" else "NORMAL VISION"
+            text = if (nightVisionEnabled) "야간 모드 ON" else "일반 화면"
             textSize = 10f
             isAllCaps = false
             setTextColor(Color.WHITE)
             setOnClickListener {
                 nightVisionEnabled = !nightVisionEnabled
                 applyCameraPreviewFilter()
-                text = if (nightVisionEnabled) "NIGHT VISION: ON" else "NORMAL VISION"
+                text = if (nightVisionEnabled) "야간 모드 ON" else "일반 화면"
             }
         }
         val switchButton = Button(this).apply {
@@ -544,31 +571,29 @@ class MainActivity : Activity(), SensorEventListener {
                 }
             }
         }
-        modeRow.addView(modeButton, LinearLayout.LayoutParams(0, dp(44), 1f))
-        modeRow.addView(switchButton, LinearLayout.LayoutParams(0, dp(44), 1f))
-        panel.addView(modeRow)
-
         val poseToggle = Button(this).apply {
-            text = "인체 모션 감지: ON"
+            text = if (poseDetectionEnabled) "인체 감지 ON" else "인체 감지 OFF"
             textSize = 10f
             isAllCaps = false
             setTextColor(Color.WHITE)
             setOnClickListener {
                 poseDetectionEnabled = !poseDetectionEnabled
-                text = if (poseDetectionEnabled) "인체 모션 감지: ON" else "인체 모션 감지: OFF"
+                text = if (poseDetectionEnabled) "인체 감지 ON" else "인체 감지 OFF"
                 if (!poseDetectionEnabled) poseOverlay?.clearPose()
+                else camera?.let { attachPosePreviewCallback(it) }
             }
         }
-        panel.addView(poseToggle, LinearLayout.LayoutParams(-1, dp(42)).apply {
-            setMargins(0, dp(6), 0, dp(6))
-        })
+        firstRow.addView(modeButton, LinearLayout.LayoutParams(0, dp(44), 1f))
+        firstRow.addView(switchButton, LinearLayout.LayoutParams(0, dp(44), 1f))
+        firstRow.addView(poseToggle, LinearLayout.LayoutParams(0, dp(44), 1f))
+        controls.addView(firstRow)
 
-        val actionRow = LinearLayout(this).apply {
+        val secondRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
         val flashButton = Button(this).apply {
-            text = "플래시 OFF"
+            text = if (flashEnabled) "플래시 ON" else "플래시 OFF"
             textSize = 10f
             isAllCaps = false
             setTextColor(Color.WHITE)
@@ -580,24 +605,18 @@ class MainActivity : Activity(), SensorEventListener {
         }
         val captureButton = Button(this).apply {
             text = "증거 사진 촬영"
-            textSize = 10f
+            textSize = 11f
             isAllCaps = false
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.rgb(30, 125, 85))
             setOnClickListener { captureEvidencePhoto() }
         }
-        actionRow.addView(flashButton, LinearLayout.LayoutParams(0, dp(46), 1f))
-        actionRow.addView(captureButton, LinearLayout.LayoutParams(0, dp(46), 1f))
-        panel.addView(actionRow)
+        secondRow.addView(flashButton, LinearLayout.LayoutParams(0, dp(48), 1f))
+        secondRow.addView(captureButton, LinearLayout.LayoutParams(0, dp(48), 1f))
+        controls.addView(secondRow)
+        cameraRoot.addView(controls, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
 
-        content.addView(panel, LinearLayout.LayoutParams(-1, -2).apply {
-            setMargins(0, 0, 0, dp(12))
-        })
-        addPanelText(
-            "MOTION TRACKING / NIGHT VISION",
-            "인체 감지는 ML Kit가 사람의 주요 관절을 추정해 점선으로 연결합니다. 외곽 점선은 관절 위치를 이용한 근사 윤곽이며 실제 신체 분할 영상은 아닙니다. 녹색 야간 모드는 화면 효과로 실제 적외선 야간 투시 기능은 아닙니다."
-        )
-        applyCameraPreviewFilter()
+        setContentView(cameraRoot)
     }
 
     private fun requestCameraPermissionAndStart() {
@@ -844,7 +863,8 @@ class MainActivity : Activity(), SensorEventListener {
                 try {
                     val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                     val displayName = "PHANTOM_$stamp.jpg"
-                    val savedLocation = savePhotoToGallery(bytes, displayName)
+                    val photoWithOverlay = composePoseOverlayIntoPhoto(bytes)
+                    val savedLocation = savePhotoToGallery(photoWithOverlay, displayName)
                     attachEvidenceToLatestRecord(savedLocation.first)
 
                     runOnUiThread {
@@ -887,6 +907,37 @@ class MainActivity : Activity(), SensorEventListener {
      * Older Android versions use the app-specific Pictures folder.
      * Returns the persisted location and a short location label.
      */
+    private fun composePoseOverlayIntoPhoto(jpegBytes: ByteArray): ByteArray {
+        val overlayView = poseOverlay ?: return jpegBytes
+        if (!poseDetectionEnabled || overlayView.width <= 0 || overlayView.height <= 0) return jpegBytes
+        val poseBitmap = try {
+            Bitmap.createBitmap(overlayView.width, overlayView.height, Bitmap.Config.ARGB_8888).also { bitmap ->
+                val canvas = Canvas(bitmap)
+                overlayView.draw(canvas)
+            }
+        } catch (_: Exception) { return jpegBytes }
+
+        val photoBitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+            ?: return jpegBytes
+        return try {
+            val scaledOverlay = Bitmap.createScaledBitmap(
+                poseBitmap, photoBitmap.width, photoBitmap.height, true
+            )
+            val canvas = Canvas(photoBitmap)
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+            canvas.drawBitmap(scaledOverlay, 0f, 0f, paint)
+            val output = java.io.ByteArrayOutputStream()
+            photoBitmap.compress(Bitmap.CompressFormat.JPEG, 94, output)
+            if (scaledOverlay !== poseBitmap) scaledOverlay.recycle()
+            poseBitmap.recycle()
+            photoBitmap.recycle()
+            output.toByteArray()
+        } catch (_: Exception) {
+            try { poseBitmap.recycle(); photoBitmap.recycle() } catch (_: Exception) { }
+            jpegBytes
+        }
+    }
+
     private fun savePhotoToGallery(bytes: ByteArray, displayName: String): Pair<String, String> {
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
             val values = ContentValues().apply {
@@ -1219,7 +1270,11 @@ class MainActivity : Activity(), SensorEventListener {
                 setPadding(0, dp(12), 0, dp(4))
             }
             eventsPanel.addView(audioTitle)
-            savedAudioFiles.asReversed().take(10).forEach { path ->
+            savedAudioFiles.asReversed().toList().forEach { path ->
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                }
                 val play = Button(this).apply {
                     text = "▶ ${evidenceDisplayName(path)}"
                     textSize = 10f
@@ -1227,7 +1282,17 @@ class MainActivity : Activity(), SensorEventListener {
                     setTextColor(Color.WHITE)
                     setOnClickListener { openEvidence(path) }
                 }
-                eventsPanel.addView(play, LinearLayout.LayoutParams(-1, dp(38)))
+                val delete = Button(this).apply {
+                    text = "삭제"
+                    textSize = 10f
+                    isAllCaps = false
+                    setTextColor(Color.WHITE)
+                    setBackgroundColor(warningColor)
+                    setOnClickListener { confirmDeleteWav(path) }
+                }
+                row.addView(play, LinearLayout.LayoutParams(0, dp(40), 1f))
+                row.addView(delete, LinearLayout.LayoutParams(dp(64), dp(40)))
+                eventsPanel.addView(row, LinearLayout.LayoutParams(-1, dp(44)))
             }
         }
 
@@ -1256,6 +1321,28 @@ class MainActivity : Activity(), SensorEventListener {
                 setMargins(0, 0, 0, dp(12))
             }
         )
+    }
+
+    private fun confirmDeleteWav(path: String) {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("녹음 파일 삭제")
+            .setMessage("이 WAV 녹음 파일을 앱과 조사 기록에서 삭제할까요?\n${evidenceDisplayName(path)}")
+            .setNegativeButton("취소", null)
+            .setPositiveButton("삭제") { _, _ ->
+                val file = File(path)
+                val deleted = !file.exists() || file.delete()
+                if (deleted) {
+                    savedAudioFiles.remove(path)
+                    investigationRecords.forEach { it.evidencePaths.remove(path) }
+                    saveSavedAudioFiles()
+                    saveInvestigationRecords()
+                    Toast.makeText(this, "녹음 파일을 삭제했습니다.", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this, "파일 삭제에 실패했습니다.", Toast.LENGTH_LONG).show()
+                }
+                showPage(1)
+            }
+            .show()
     }
 
     private fun requestAudioPermissionAndStart() {
