@@ -404,28 +404,40 @@ override fun onAccuracyChanged(
     }
 }
 
+
 class RadarView(context: android.content.Context) : View(context) {
 
+    private val radarGreen = Color.rgb(60, 220, 150)
+    private val radarBackground = Color.rgb(8, 20, 18)
+
+    private val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = radarBackground
+        style = Paint.Style.FILL
+    }
+
     private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.rgb(40, 120, 90)
+        color = Color.rgb(40, 130, 95)
         style = Paint.Style.STROKE
-        strokeWidth = 1.5f
+        strokeWidth = 2f
     }
 
     private val sweepPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.rgb(70, 220, 150)
-        strokeWidth = 3f
+        color = radarGreen
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
+        strokeCap = Paint.Cap.ROUND
     }
 
-    private val blipPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.rgb(255, 70, 70)
+    private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.RED
         style = Paint.Style.FILL
     }
 
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
-        textSize = 12f
+        textSize = 13f
         typeface = Typeface.DEFAULT_BOLD
+        textAlign = Paint.Align.CENTER
     }
 
     private var sweepAngle = 0f
@@ -433,6 +445,11 @@ class RadarView(context: android.content.Context) : View(context) {
     private var direction = 0f
     private var calibrationProgress = 0f
     private var calibrated = false
+
+    init {
+        setWillNotDraw(false)
+        setBackgroundColor(radarBackground)
+    }
 
     fun setCalibration(progress: Float) {
         calibrationProgress = progress.coerceIn(0f, 1f)
@@ -445,6 +462,7 @@ class RadarView(context: android.content.Context) : View(context) {
         direction = Math.toDegrees(
             atan2(y.toDouble(), x.toDouble())
         ).toFloat()
+
         calibrated = true
         invalidate()
     }
@@ -452,92 +470,104 @@ class RadarView(context: android.content.Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 
-        val w = width.toFloat()
-        val h = height.toFloat()
+        val cx = width / 2f
+        val cy = height / 2f
+        val radius = minOf(width, height) * 0.36f
 
-        canvas.drawColor(Color.rgb(8, 18, 20))
+        // 배경
+        canvas.drawRect(
+            0f, 0f, width.toFloat(), height.toFloat(),
+            backgroundPaint
+        )
 
-        val cx = w / 2f
-        val cy = h / 2f
-        val radius = min(w, h) * 0.39f
+        // 레이더 원형 격자
+        canvas.drawCircle(cx, cy, radius, gridPaint)
+        canvas.drawCircle(cx, cy, radius * 0.75f, gridPaint)
+        canvas.drawCircle(cx, cy, radius * 0.5f, gridPaint)
+        canvas.drawCircle(cx, cy, radius * 0.25f, gridPaint)
 
-        val backgroundPaint = Paint().apply {
-            color = Color.rgb(10, 35, 30)
-            style = Paint.Style.FILL
-        }
-
-        canvas.drawCircle(cx, cy, radius, backgroundPaint)
-
-        for (i in 1..4) {
-            canvas.drawCircle(
-                cx, cy, radius * i / 4f, gridPaint
-            )
-        }
-
+        // 십자 기준선
         canvas.drawLine(
-            cx - radius, cy, cx + radius, cy, gridPaint
+            cx - radius, cy,
+            cx + radius, cy, gridPaint
         )
 
         canvas.drawLine(
-            cx, cy - radius, cx, cy + radius, gridPaint
+            cx, cy - radius,
+            cx, cy + radius, gridPaint
         )
 
-        val sweepRadians = Math.toRadians(
-            sweepAngle.toDouble()
+        // 회전 스캔 라인
+        val radians = Math.toRadians(sweepAngle.toDouble())
+
+        val endX = cx + cos(radians).toFloat() * radius
+        val endY = cy + sin(radians).toFloat() * radius
+
+        canvas.drawLine(
+            cx, cy, endX, endY, sweepPaint
         )
 
-        val endX = cx + cos(sweepRadians).toFloat() * radius
-        val endY = cy + sin(sweepRadians).toFloat() * radius
+        // 중앙 표시
+        canvas.drawCircle(cx, cy, 5f, dotPaint)
 
-      sweepPaint.shader = null
-sweepPaint.alpha = 220
-
-canvas.drawLine(
-    cx, cy, endX, endY, sweepPaint
-)
-
+        // 자기장 변화 감지점
         if (calibrated && deviation > 1.5f) {
-            val blipRadius = radius *
-                    (0.25f + (deviation / 30f).coerceIn(0f, 0.65f))
+
+            val distance = radius * (
+                0.25f + (deviation / 30f).coerceIn(0f, 0.65f)
+            )
 
             val angle = Math.toRadians(direction.toDouble())
 
-            val bx = cx + cos(angle).toFloat() * blipRadius
-            val by = cy - sin(angle).toFloat() * blipRadius
+            val dotX = cx + cos(angle).toFloat() * distance
+            val dotY = cy - sin(angle).toFloat() * distance
 
-            blipPaint.color = when {
+            dotPaint.color = when {
                 deviation < 5f -> Color.YELLOW
                 deviation < 10f -> Color.rgb(255, 150, 35)
                 else -> Color.RED
             }
 
-            canvas.drawCircle(bx, by, 8f, blipPaint)
-            canvas.drawCircle(bx, by, 14f, gridPaint)
+            canvas.drawCircle(dotX, dotY, 9f, dotPaint)
+            dotPaint.color = Color.RED
         }
 
+        // 방향 표시
         textPaint.textAlign = Paint.Align.CENTER
 
-        if (!calibrated) {
-            canvas.drawText(
-                "CALIBRATING ${(calibrationProgress * 100).toInt()}%",
-                cx, cy + radius + 28f, textPaint
-            )
-        } else {
-            canvas.drawText(
-                String.format(Locale.US, "CHANGE %.1f μT", deviation),
-                cx, cy + radius + 28f, textPaint
-            )
-        }
+        canvas.drawText("N", cx, cy - radius - 12f, textPaint)
+        canvas.drawText("S", cx, cy + radius + 24f, textPaint)
 
         textPaint.textAlign = Paint.Align.LEFT
-        canvas.drawText("N", cx - 5f, cy - radius - 12f, textPaint)
-        canvas.drawText("E", cx + radius + 10f, cy + 5f, textPaint)
-        canvas.drawText("S", cx - 5f, cy + radius + 22f, textPaint)
         canvas.drawText("W", cx - radius - 20f, cy + 5f, textPaint)
 
+        textPaint.textAlign = Paint.Align.RIGHT
+        canvas.drawText("E", cx + radius + 20f, cy + 5f, textPaint)
+
+        // 상태 표시
+        textPaint.textAlign = Paint.Align.CENTER
+
+        val status = if (calibrated) {
+            String.format(
+                Locale.US,
+                "FIELD CHANGE: %.1f uT",
+                deviation
+            )
+        } else {
+            "CALIBRATING ${(calibrationProgress * 100).toInt()}%"
+        }
+
+        canvas.drawText(
+            status,
+            cx,
+            height - 12f,
+            textPaint
+        )
+
+        // 다음 화면 갱신
         sweepAngle = (sweepAngle + 3f) % 360f
 
- if (isAttachedToWindow) {
+        if (isAttachedToWindow) {
             postInvalidateDelayed(100)
         }
     }
