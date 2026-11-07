@@ -15,6 +15,14 @@ import java.io.FileOutputStream
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.MediaPlayer
+import android.view.ViewGroup
+import android.graphics.drawable.ColorDrawable
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.pose.Pose
+import com.google.mlkit.vision.pose.PoseDetection
+import com.google.mlkit.vision.pose.PoseDetector
+import com.google.mlkit.vision.pose.defaults.PoseDetectorOptions
 import android.os.Process
 import android.content.SharedPreferences
 import android.os.Bundle
@@ -38,7 +46,8 @@ data class InvestigationRecord(
     val timestamp: Long,
     val fieldValue: Float,
     val deviation: Float,
-    val level: String
+    val level: String,
+    val evidencePaths: MutableList<String> = mutableListOf()
 )
 
 class MainActivity : Activity(), SensorEventListener {
@@ -87,6 +96,15 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var soundPreferences: SharedPreferences
     private val soundEventThresholdDbfs = -25f
 
+    @Volatile private var wavRecording = false
+    @Volatile private var wavBytesWritten = 0L
+    private var wavPcmStream: FileOutputStream? = null
+    private var wavTempFile: File? = null
+    private var wavRecordButton: Button? = null
+    private var wavRecordStatus: TextView? = null
+    private val savedAudioFiles = mutableListOf<String>()
+    private var spectrumView: SpectrumView? = null
+
     private var camera: Camera? = null
     private var cameraSurfaceView: SurfaceView? = null
     private var cameraSurfaceHolder: SurfaceHolder? = null
@@ -98,6 +116,14 @@ class MainActivity : Activity(), SensorEventListener {
     private var cameraPageVisible = false
     private var cameraPreviewReady = false
     private var cameraPermissionPending = false
+
+    private var poseDetector: PoseDetector? = null
+    private var poseOverlay: PoseOverlayView? = null
+    @Volatile private var poseProcessing = false
+    private var poseRotationDegrees = 0
+    private var poseImageWidth = 0
+    private var poseImageHeight = 0
+    private var poseDetectionEnabled = true
 
     private var baselineTotal = 0f
     private var baselineCount = 0
@@ -200,6 +226,7 @@ class MainActivity : Activity(), SensorEventListener {
         soundPreferences = getSharedPreferences("phantom_scope_sound_events", MODE_PRIVATE)
         loadInvestigationRecords()
         loadSoundEvents()
+        loadSavedAudioFiles()
         showPage(0)
     }
 
@@ -283,6 +310,7 @@ class MainActivity : Activity(), SensorEventListener {
         stopAudioMonitoring()
         cameraPageVisible = false
         releaseCamera()
+        closePoseDetector()
         super.onPause()
         sensorManager.unregisterListener(this)
     }
@@ -476,6 +504,10 @@ class MainActivity : Activity(), SensorEventListener {
         cameraNightOverlay = nightOverlay
         previewFrame.addView(nightOverlay, FrameLayout.LayoutParams(-1, -1))
 
+        val poseView = PoseOverlayView(this)
+        poseOverlay = poseView
+        previewFrame.addView(poseView, FrameLayout.LayoutParams(-1, -1))
+
         panel.addView(previewFrame, LinearLayout.LayoutParams(-1, dp(300)).apply {
             setMargins(0, dp(12), 0, dp(12))
         })
@@ -512,6 +544,21 @@ class MainActivity : Activity(), SensorEventListener {
         modeRow.addView(switchButton, LinearLayout.LayoutParams(0, dp(44), 1f))
         panel.addView(modeRow)
 
+        val poseToggle = Button(this).apply {
+            text = "인체 모션 감지: ON"
+            textSize = 10f
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            setOnClickListener {
+                poseDetectionEnabled = !poseDetectionEnabled
+                text = if (poseDetectionEnabled) "인체 모션 감지: ON" else "인체 모션 감지: OFF"
+                if (!poseDetectionEnabled) poseOverlay?.clearPose()
+            }
+        }
+        panel.addView(poseToggle, LinearLayout.LayoutParams(-1, dp(42)).apply {
+            setMargins(0, dp(6), 0, dp(6))
+        })
+
         val actionRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -543,8 +590,8 @@ class MainActivity : Activity(), SensorEventListener {
             setMargins(0, 0, 0, dp(12))
         })
         addPanelText(
-            "NIGHT VISION MODE",
-            "녹색 오버레이는 미리보기에 적용되는 시각 효과입니다. 실제 적외선 야간 투시 기능은 아니며 어두운 환경에서 카메라 센서의 한계를 없애지는 않습니다."
+            "MOTION TRACKING / NIGHT VISION",
+            "인체 감지는 ML Kit가 사람의 주요 관절을 추정해 점선으로 연결합니다. 외곽 점선은 관절 위치를 이용한 근사 윤곽이며 실제 신체 분할 영상은 아닙니다. 녹색 야간 모드는 화면 효과로 실제 적외선 야간 투시 기능은 아닙니다."
         )
         applyCameraPreviewFilter()
     }
@@ -669,6 +716,17 @@ class MainActivity : Activity(), SensorEventListener {
                 if (info.facing == Camera.CameraInfo.CAMERA_FACING_FRONT) (360 - result) % 360 else result
             )
             opened.setPreviewDisplay(holder)
+            poseRotationDegrees = result
+            val previewSize = opened.parameters.previewSize
+            poseImageWidth = previewSize?.width ?: 640
+            poseImageHeight = previewSize?.height ?: 480
+            ensurePoseDetector()
+            opened.setPreviewCallback { data, source ->
+                if (poseDetectionEnabled && data != null && !poseProcessing && cameraPageVisible) {
+                    val size = source.parameters.previewSize
+                    if (size != null) processPoseFrame(data, size.width, size.height, poseRotationDegrees, useFrontCamera)
+                }
+            }
             opened.startPreview()
             cameraStatusText?.apply {
                 text = if (useFrontCamera) "FRONT CAMERA ACTIVE" else "REAR CAMERA ACTIVE"
@@ -679,6 +737,65 @@ class MainActivity : Activity(), SensorEventListener {
         } catch (e: Throwable) {
             showCameraFailure(e)
         }
+    }
+
+    private fun ensurePoseDetector() {
+        if (poseDetector != null) return
+        try {
+            val options = PoseDetectorOptions.Builder()
+                .setDetectorMode(PoseDetectorOptions.STREAM_MODE)
+                .build()
+            poseDetector = PoseDetection.getClient(options)
+        } catch (_: Exception) {
+            cameraStatusText?.text = "POSE DETECTOR INIT FAILED"
+        }
+    }
+
+    private fun attachPosePreviewCallback(active: Camera) {
+        try {
+            active.setPreviewCallback { data, source ->
+                if (poseDetectionEnabled && data != null && !poseProcessing && cameraPageVisible) {
+                    val size = source.parameters.previewSize
+                    if (size != null) processPoseFrame(data, size.width, size.height, poseRotationDegrees, useFrontCamera)
+                }
+            }
+        } catch (_: Exception) { }
+    }
+
+    private fun processPoseFrame(
+        data: ByteArray, width: Int, height: Int, rotation: Int, front: Boolean
+    ) {
+        val detector = poseDetector ?: return
+        poseProcessing = true
+        try {
+            val image = InputImage.fromByteArray(
+                data, width, height, rotation, InputImage.IMAGE_FORMAT_NV21
+            )
+            detector.process(image)
+                .addOnSuccessListener { pose ->
+                    poseOverlay?.setPose(pose, width, height, rotation, front)
+                    cameraStatusText?.text = if (pose.allPoseLandmarks.isNotEmpty()) {
+                        "PERSON DETECTED  |  ${pose.allPoseLandmarks.size} BODY POINTS"
+                    } else {
+                        if (camera != null) "SCANNING FOR HUMAN FORM" else "CAMERA STANDBY"
+                    }
+                }
+                .addOnFailureListener {
+                    cameraStatusText?.text = "POSE ANALYSIS UNAVAILABLE"
+                }
+                .addOnCompleteListener {
+                    poseProcessing = false
+                }
+        } catch (_: Exception) {
+            poseProcessing = false
+        }
+    }
+
+    private fun closePoseDetector() {
+        try { poseDetector?.close() } catch (_: Exception) { }
+        poseDetector = null
+        poseOverlay?.clearPose()
+        poseProcessing = false
     }
 
     private fun applyCameraPreviewFilter() {
@@ -726,6 +843,7 @@ class MainActivity : Activity(), SensorEventListener {
                     val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                     val photo = File(folder, "PHANTOM_$stamp.jpg")
                     FileOutputStream(photo).use { it.write(bytes) }
+                    attachEvidenceToLatestRecord(photo.absolutePath)
                     runOnUiThread {
                         cameraStatusText?.apply {
                             text = "EVIDENCE SAVED: $stamp"
@@ -740,7 +858,10 @@ class MainActivity : Activity(), SensorEventListener {
                         }
                     }
                 } finally {
-                    try { sourceCamera.startPreview() } catch (_: Exception) { }
+                    try {
+                        sourceCamera.startPreview()
+                        attachPosePreviewCallback(sourceCamera)
+                    } catch (_: Exception) { }
                 }
             }
         } catch (_: Exception) {
@@ -753,6 +874,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     @Suppress("DEPRECATION")
     private fun releaseCamera() {
+        try { camera?.setPreviewCallback(null) } catch (_: Exception) { }
         try { camera?.stopPreview() } catch (_: Exception) { }
         try { camera?.release() } catch (_: Exception) { }
         camera = null
@@ -783,6 +905,51 @@ class MainActivity : Activity(), SensorEventListener {
         }
     }
 
+    private fun attachEvidenceToLatestRecord(path: String) {
+        if (investigationRecords.isEmpty()) {
+            investigationRecords.add(
+                InvestigationRecord(System.currentTimeMillis(), currentValue, 0f, "EVIDENCE")
+            )
+        }
+        investigationRecords.last().evidencePaths.add(path)
+        saveInvestigationRecords()
+    }
+
+    private fun openEvidence(path: String) {
+        val file = File(path)
+        if (!file.exists()) {
+            Toast.makeText(this, "파일을 찾을 수 없습니다.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (path.lowercase(Locale.US).endsWith(".jpg") || path.lowercase(Locale.US).endsWith(".jpeg")) {
+            val image = ImageView(this).apply {
+                setImageBitmap(BitmapFactory.decodeFile(path))
+                adjustViewBounds = true
+                scaleType = ImageView.ScaleType.FIT_CENTER
+            }
+            ScrollView(this).apply {
+                addView(image)
+                android.app.AlertDialog.Builder(this@MainActivity)
+                    .setTitle("조사 증거 사진")
+                    .setView(this)
+                    .setPositiveButton("닫기", null)
+                    .show()
+            }
+        } else {
+            try {
+                val player = MediaPlayer().apply {
+                    setDataSource(path)
+                    setOnCompletionListener { it.release() }
+                    prepare()
+                    start()
+                }
+                Toast.makeText(this, "녹음 파일 재생 중", Toast.LENGTH_SHORT).show()
+            } catch (_: Exception) {
+                Toast.makeText(this, "녹음 파일을 재생할 수 없습니다.", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
     private fun saveInvestigationRecords() {
         val array = JSONArray()
         investigationRecords.forEach { record ->
@@ -791,6 +958,7 @@ class MainActivity : Activity(), SensorEventListener {
                 put("fieldValue", record.fieldValue.toDouble())
                 put("deviation", record.deviation.toDouble())
                 put("level", record.level)
+                put("evidencePaths", JSONArray(record.evidencePaths))
             })
         }
         logPreferences.edit().putString("records", array.toString()).apply()
@@ -808,7 +976,10 @@ class MainActivity : Activity(), SensorEventListener {
                         item.optLong("timestamp"),
                         item.optDouble("fieldValue").toFloat(),
                         item.optDouble("deviation").toFloat(),
-                        item.optString("level", "UNKNOWN")
+                        item.optString("level", "UNKNOWN"),
+                        item.optJSONArray("evidencePaths")?.let { paths ->
+                            MutableList(paths.length()) { index -> paths.optString(index) }
+                        } ?: mutableListOf()
                     )
                 )
             }
@@ -854,6 +1025,12 @@ class MainActivity : Activity(), SensorEventListener {
         soundWaveView = wave
         livePanel.addView(wave, LinearLayout.LayoutParams(-1, dp(130)))
 
+        val spectrum = SpectrumView(this)
+        spectrumView = spectrum
+        livePanel.addView(spectrum, LinearLayout.LayoutParams(-1, dp(100)).apply {
+            setMargins(0, dp(8), 0, 0)
+        })
+
         val toggle = Button(this).apply {
             text = if (audioRunning) "마이크 감지 중지" else "마이크 감지 시작"
             textSize = 12f
@@ -876,6 +1053,35 @@ class MainActivity : Activity(), SensorEventListener {
                 setMargins(0, dp(12), 0, 0)
             }
         )
+
+        val wavStatus = TextView(this).apply {
+            text = if (wavRecording) "WAV 녹음 중" else "WAV 녹음 대기"
+            textSize = 11f
+            setTextColor(if (wavRecording) warningColor else Color.LTGRAY)
+            setPadding(0, dp(10), 0, dp(4))
+        }
+        wavRecordStatus = wavStatus
+        livePanel.addView(wavStatus)
+
+        val wavButton = Button(this).apply {
+            text = if (wavRecording) "WAV 녹음 종료 및 저장" else "WAV 녹음 시작"
+            textSize = 11f
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            setBackgroundColor(if (wavRecording) warningColor else Color.rgb(40, 95, 145))
+            setOnClickListener {
+                if (wavRecording) stopWavRecording() else {
+                    if (!audioRunning) requestAudioPermissionAndStart()
+                    if (audioRunning) startWavRecording()
+                    else Toast.makeText(this@MainActivity, "먼저 마이크 감지를 시작하고 다시 눌러주세요.", Toast.LENGTH_SHORT).show()
+                }
+                showPage(1)
+            }
+        }
+        wavRecordButton = wavButton
+        livePanel.addView(wavButton, LinearLayout.LayoutParams(-1, dp(44)).apply {
+            setMargins(0, dp(4), 0, 0)
+        })
 
         content.addView(
             livePanel,
@@ -917,6 +1123,27 @@ class MainActivity : Activity(), SensorEventListener {
                     setPadding(0, dp(7), 0, dp(7))
                 }
                 eventsPanel.addView(row)
+            }
+        }
+
+        if (savedAudioFiles.isNotEmpty()) {
+            val audioTitle = TextView(this).apply {
+                text = "SAVED WAV RECORDINGS"
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(accentColor)
+                setPadding(0, dp(12), 0, dp(4))
+            }
+            eventsPanel.addView(audioTitle)
+            savedAudioFiles.asReversed().take(10).forEach { path ->
+                val play = Button(this).apply {
+                    text = "▶ ${File(path).name}"
+                    textSize = 10f
+                    isAllCaps = false
+                    setTextColor(Color.WHITE)
+                    setOnClickListener { openEvidence(path) }
+                }
+                eventsPanel.addView(play, LinearLayout.LayoutParams(-1, dp(38)))
             }
         }
 
@@ -1034,6 +1261,7 @@ class MainActivity : Activity(), SensorEventListener {
                 }
 
                 if (readCount > 0) {
+                    if (wavRecording) writeWavPcm(buffer, readCount)
                     var sumSquares = 0.0
                     var peak = 0
 
@@ -1054,8 +1282,10 @@ class MainActivity : Activity(), SensorEventListener {
                     val waveform = FloatArray(readCount) {
                         buffer[it].toFloat() / 32768f
                     }
+                    val spectrumSamples = buffer.copyOf(readCount)
 
                     processSoundEvent(dbfs)
+                    spectrumView?.setSamples(spectrumSamples, sampleRate)
 
                     runOnUiThread {
                         if (audioRunning) {
@@ -1085,7 +1315,113 @@ class MainActivity : Activity(), SensorEventListener {
         }
     }
 
+    private fun startWavRecording() {
+        if (!audioRunning) {
+            Toast.makeText(this, "마이크 감지를 먼저 시작하세요.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (wavRecording) return
+        try {
+            val folder = File(getExternalFilesDir(Environment.DIRECTORY_MUSIC), "PhantomScope")
+            if (!folder.exists()) folder.mkdirs()
+            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val temp = File(folder, "PHANTOM_AUDIO_$stamp.pcm")
+            wavPcmStream = FileOutputStream(temp)
+            wavTempFile = temp
+            wavBytesWritten = 0L
+            wavRecording = true
+            wavRecordStatus?.apply { text = "WAV 녹음 중 · 44.1 kHz / 16-bit / Mono"; setTextColor(warningColor) }
+            wavRecordButton?.text = "WAV 녹음 종료 및 저장"
+        } catch (_: Exception) {
+            wavRecording = false
+            Toast.makeText(this, "녹음 파일을 만들 수 없습니다.", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    @Synchronized
+    private fun writeWavPcm(samples: ShortArray, count: Int) {
+        val stream = wavPcmStream ?: return
+        try {
+            val bytes = ByteArray(count * 2)
+            for (i in 0 until count) {
+                val value = samples[i].toInt()
+                bytes[i * 2] = (value and 0xff).toByte()
+                bytes[i * 2 + 1] = ((value shr 8) and 0xff).toByte()
+            }
+            stream.write(bytes)
+            wavBytesWritten += bytes.size
+        } catch (_: Exception) {
+            wavRecording = false
+        }
+    }
+
+    @Synchronized
+    private fun stopWavRecording() {
+        if (!wavRecording && wavPcmStream == null) return
+        wavRecording = false
+        try { wavPcmStream?.flush(); wavPcmStream?.close() } catch (_: Exception) { }
+        wavPcmStream = null
+        val temp = wavTempFile
+        if (temp != null && temp.exists() && wavBytesWritten > 0) {
+            try {
+                val wav = File(temp.parentFile, temp.nameWithoutExtension + ".wav")
+                FileOutputStream(wav).use { out ->
+                    out.write(createWavHeader(wavBytesWritten.toInt(), 44100, 1, 16))
+                    temp.inputStream().use { input -> input.copyTo(out) }
+                }
+                temp.delete()
+                savedAudioFiles.add(wav.absolutePath)
+                if (savedAudioFiles.size > 100) savedAudioFiles.removeAt(0)
+                saveSavedAudioFiles()
+                attachEvidenceToLatestRecord(wav.absolutePath)
+                wavRecordStatus?.apply { text = "저장 완료: ${wav.name}"; setTextColor(accentColor) }
+                Toast.makeText(this, "WAV 녹음 저장 완료", Toast.LENGTH_LONG).show()
+            } catch (_: Exception) {
+                Toast.makeText(this, "WAV 파일 저장에 실패했습니다.", Toast.LENGTH_LONG).show()
+            }
+        } else {
+            temp?.delete()
+        }
+        wavTempFile = null
+        wavRecordButton?.text = "WAV 녹음 시작"
+    }
+
+    private fun createWavHeader(dataLength: Int, sampleRate: Int, channels: Int, bits: Int): ByteArray {
+        val total = dataLength + 36
+        val byteRate = sampleRate * channels * bits / 8
+        val header = ByteArray(44)
+        fun putAscii(offset: Int, value: String) {
+            value.toByteArray(Charsets.US_ASCII).copyInto(header, offset)
+        }
+        fun putInt(offset: Int, value: Int) {
+            for (i in 0..3) header[offset + i] = (value shr (8 * i)).toByte()
+        }
+        fun putShort(offset: Int, value: Int) {
+            header[offset] = (value and 0xff).toByte()
+            header[offset + 1] = ((value shr 8) and 0xff).toByte()
+        }
+        putAscii(0, "RIFF"); putInt(4, total); putAscii(8, "WAVE")
+        putAscii(12, "fmt "); putInt(16, 16); putShort(20, 1)
+        putShort(22, channels); putInt(24, sampleRate); putInt(28, byteRate)
+        putShort(32, channels * bits / 8); putShort(34, bits)
+        putAscii(36, "data"); putInt(40, dataLength)
+        return header
+    }
+
+    private fun saveSavedAudioFiles() {
+        soundPreferences.edit().putString("wav_files", JSONArray(savedAudioFiles).toString()).apply()
+    }
+
+    private fun loadSavedAudioFiles() {
+        savedAudioFiles.clear()
+        try {
+            val array = JSONArray(soundPreferences.getString("wav_files", "[]"))
+            for (i in 0 until array.length()) savedAudioFiles.add(array.optString(i))
+        } catch (_: Exception) { savedAudioFiles.clear() }
+    }
+
     private fun stopAudioMonitoring() {
+        if (wavRecording) stopWavRecording()
         audioRunning = false
         val recorder = audioRecord
         audioRecord = null
@@ -1309,13 +1645,31 @@ class MainActivity : Activity(), SensorEventListener {
             panel.addView(header)
 
             val detail = TextView(this).apply {
-                text = "FIELD  ${formatField(record.fieldValue)}\n" +
-                    "DEVIATION  +${String.format(Locale.US, "%.1f", record.deviation)} μT"
+                text = if (record.level == "EVIDENCE") {
+                    "수동 증거 자료가 연결된 조사 기록"
+                } else {
+                    "FIELD  ${formatField(record.fieldValue)}\\n" +
+                        "DEVIATION  +${String.format(Locale.US, "%.1f", record.deviation)} μT"
+                }
                 textSize = 12f
                 setTextColor(Color.WHITE)
                 setPadding(0, dp(10), 0, dp(8))
             }
             panel.addView(detail)
+
+            record.evidencePaths.forEach { path ->
+                val evidenceButton = Button(this).apply {
+                    val name = File(path).name
+                    text = if (name.endsWith(".jpg", true)) "📷 사진 열기: $name" else "▶ 녹음 재생: $name"
+                    textSize = 10f
+                    isAllCaps = false
+                    setTextColor(Color.WHITE)
+                    setOnClickListener { openEvidence(path) }
+                }
+                panel.addView(evidenceButton, LinearLayout.LayoutParams(-1, dp(38)).apply {
+                    setMargins(0, dp(4), 0, 0)
+                })
+            }
 
             val delete = Button(this).apply {
                 text = "이 기록 삭제"
@@ -1915,4 +2269,114 @@ class SoundWaveView(context: android.content.Context) : View(context) {
         }
         canvas.drawPath(path, wavePaint)
     }
+}
+
+
+class SpectrumView(context: Context) : View(context) {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private var levels = FloatArray(8)
+    fun setSamples(samples: ShortArray, sampleRate: Int) {
+        val bands = intArrayOf(100, 200, 400, 800, 1600, 3200, 6400, 10000)
+        levels = FloatArray(bands.size) { index ->
+            val frequency = bands[index]
+            var re = 0.0
+            var im = 0.0
+            val count = minOf(samples.size, 1024)
+            for (n in 0 until count) {
+                val angle = 2.0 * Math.PI * frequency * n / sampleRate
+                re += samples[n] * cos(angle)
+                im -= samples[n] * sin(angle)
+            }
+            (sqrt(re * re + im * im) / (count * 32768.0)).toFloat().coerceIn(0f, 1f)
+        }
+        postInvalidate()
+    }
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        canvas.drawColor(Color.rgb(9, 15, 18))
+        val gap = width * 0.025f
+        val barWidth = (width - gap * 9) / 8f
+        levels.forEachIndexed { i, level ->
+            val left = gap + i * (barWidth + gap)
+            val heightValue = max(dp(3f), (height - dp(24f)) * level * 5f)
+            paint.color = Color.rgb(65, 220, 145)
+            canvas.drawRoundRect(left, height - dp(18f) - heightValue, left + barWidth, height - dp(18f), dp(3f), dp(3f), paint)
+            paint.color = Color.LTGRAY
+            paint.textSize = dp(8f)
+            canvas.drawText("${intArrayOf(100,200,400,800,1600,3200,6400,10000)[i]}", left, height - dp(4f), paint)
+        }
+    }
+    private fun dp(v: Float) = v * resources.displayMetrics.density
+}
+
+class PoseOverlayView(context: Context) : View(context) {
+    private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(70, 255, 150); style = Paint.Style.STROKE; strokeWidth = 2.5f
+        pathEffect = android.graphics.DashPathEffect(floatArrayOf(5f, 7f), 0f)
+    }
+    private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(120, 255, 175); style = Paint.Style.FILL
+    }
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(120, 255, 175); textSize = 13f; typeface = Typeface.DEFAULT_BOLD
+    }
+    @Volatile private var poseData: Pose? = null
+    private var sourceWidth = 0
+    private var sourceHeight = 0
+    private var rotation = 0
+    private var front = false
+    fun setPose(pose: Pose, width: Int, height: Int, rotationDegrees: Int, isFront: Boolean) {
+        poseData = pose; sourceWidth = width; sourceHeight = height
+        rotation = rotationDegrees; front = isFront
+        postInvalidate()
+    }
+    fun clearPose() { poseData = null; postInvalidate() }
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val pose = poseData ?: return
+        if (pose.allPoseLandmarks.isEmpty() || sourceWidth == 0 || sourceHeight == 0) return
+        val rotated = rotation == 90 || rotation == 270
+        val imageW = if (rotated) sourceHeight.toFloat() else sourceWidth.toFloat()
+        val imageH = if (rotated) sourceWidth.toFloat() else sourceHeight.toFloat()
+        val scale = max(width / imageW, height / imageH)
+        val dx = (width - imageW * scale) / 2f
+        val dy = (height - imageH * scale) / 2f
+        val save = canvas.save()
+        if (front) {
+            canvas.scale(-1f, 1f, width / 2f, height / 2f)
+        }
+        fun point(type: Int): PointF? {
+            val landmark = pose.getPoseLandmark(type) ?: return null
+            return PointF(dx + landmark.position.x * scale, dy + landmark.position.y * scale)
+        }
+        val connections = arrayOf(
+            intArrayOf(11,12), intArrayOf(11,13), intArrayOf(13,15),
+            intArrayOf(12,14), intArrayOf(14,16), intArrayOf(11,23),
+            intArrayOf(12,24), intArrayOf(23,24), intArrayOf(23,25),
+            intArrayOf(25,27), intArrayOf(24,26), intArrayOf(26,28),
+            intArrayOf(27,29), intArrayOf(29,31), intArrayOf(28,30), intArrayOf(30,32)
+        )
+        connections.forEach { pair ->
+            val a = point(pair[0]); val b = point(pair[1])
+            if (a != null && b != null) canvas.drawLine(a.x, a.y, b.x, b.y, linePaint)
+        }
+        // Dotted body contour approximated from shoulder, elbow, wrist, hip, knee and ankle landmarks.
+        val contour = listOf(11,13,15,17,19,15,13,11,23,25,27,31,27,25,23,24,26,28,32,28,26,24,12,14,16,18,20,16,14,12)
+            .mapNotNull { point(it) }
+        if (contour.size > 2) {
+            val path = Path().apply {
+                moveTo(contour.first().x, contour.first().y)
+                contour.drop(1).forEach { lineTo(it.x, it.y) }
+                close()
+            }
+            canvas.drawPath(path, linePaint)
+        }
+        pose.allPoseLandmarks.forEach { landmark ->
+            val p = point(landmark.landmarkType)
+            if (p != null) canvas.drawCircle(p.x, p.y, 3.8f, dotPaint)
+        }
+        canvas.drawText("HUMAN TRACKING", dp(10f), dp(20f), textPaint)
+        canvas.restoreToCount(save)
+    }
+    private fun dp(v: Float) = v * resources.displayMetrics.density
 }
