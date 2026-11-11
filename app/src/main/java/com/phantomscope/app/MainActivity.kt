@@ -316,26 +316,15 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun createSpectrum(): View {
         val panel = makePanel()
-        // EMF 표시부는 숫자나 설명 없이 색상 LED만 표시합니다.
+        // EMF LED는 개별 View 대신 Canvas에서 직접 그려 작은 칸도 색상이 선명하게 보이게 합니다.
         fieldValueText = TextView(this).apply { visibility = View.GONE }
-        val bar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            setPadding(0, dp(14), 0, dp(14))
+        val ledView = EmfLedSpectrumView(this).apply {
+            setFieldValue(currentValue)
         }
-        spectrumSegments.clear()
-        // 300개 셀은 현재 EMF 값에 따라 모두 같은 단계 색으로 켜집니다.
-        // 값이 오르면 실제 점등 색 자체가 녹색 → 노랑 → 주황 → 빨강으로 이동합니다.
-        for (index in 0 until 300) {
-            val segment = View(this).apply {
-                background = roundedBackground(Color.rgb(35, 65, 42), 3)
-                alpha = 0.10f
-            }
-            spectrumSegments.add(segment)
-            bar.addView(segment, LinearLayout.LayoutParams(0, dp(24), 1f))
-        }
-        panel.addView(bar)
-        spectrumBar = bar
+        spectrumBar = ledView
+        panel.addView(ledView, LinearLayout.LayoutParams(-1, dp(52)).apply {
+            setMargins(dp(2), dp(8), dp(2), dp(8))
+        })
         sensorStatusText = TextView(this).apply {
             text = ""
             visibility = View.GONE
@@ -407,45 +396,16 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun updateSpectrum(value: Float) {
-        // 모든 활성 LED의 색상을 센서값으로 직접 계산합니다.
-        // 이전처럼 LED 위치만 늘리는 방식이 아니라, 측정값이 오르면 켜진 LED 전체 색도 변합니다.
+        // 20~200 μT를 300 LED에 직접 매핑합니다. 200 μT 이상은 빨간색 최대 단계입니다.
         spectrumSamples.addLast(value)
         while (spectrumSamples.size > 3) spectrumSamples.removeFirst()
         smoothedSpectrumValue = spectrumSamples.average().toFloat()
-
         val normalized = ((smoothedSpectrumValue - 20f) / 180f).coerceIn(0f, 1f)
-        val exactLevel = normalized * spectrumSegments.size
-        lastSpectrumLevel = exactLevel.toInt().coerceIn(0, spectrumSegments.size)
+        lastSpectrumLevel = (normalized * 300f).roundToInt().coerceIn(0, 300)
 
-        // 20μT=녹색, 80μT=노랑, 140μT=주황, 200μT=빨강
-        val hue = when {
-            smoothedSpectrumValue <= 80f ->
-                120f - ((smoothedSpectrumValue - 20f) / 60f).coerceIn(0f, 1f) * 60f
-            smoothedSpectrumValue <= 140f ->
-                60f - ((smoothedSpectrumValue - 80f) / 60f).coerceIn(0f, 1f) * 30f
-            else ->
-                30f - ((smoothedSpectrumValue - 140f) / 60f).coerceIn(0f, 1f) * 30f
-        }
-        val activeColor = Color.HSVToColor(floatArrayOf(hue, 1f, 1f))
-        val inactiveColor = Color.rgb(24, 38, 28)
-        val partial = exactLevel - lastSpectrumLevel
+        // 색상은 단어 글자색과 완전히 독립적이며, 전용 Canvas 뷰가 직접 렌더링합니다.
+        (spectrumBar as? EmfLedSpectrumView)?.setFieldValue(smoothedSpectrumValue)
 
-        spectrumSegments.forEachIndexed { index, segment ->
-            when {
-                index < lastSpectrumLevel -> {
-                    segment.background = roundedBackground(activeColor, 3)
-                    segment.alpha = 1f
-                }
-                index == lastSpectrumLevel && lastSpectrumLevel < spectrumSegments.size -> {
-                    segment.background = roundedBackground(activeColor, 3)
-                    segment.alpha = 0.20f + partial * 0.80f
-                }
-                else -> {
-                    segment.background = roundedBackground(inactiveColor, 3)
-                    segment.alpha = 0.35f
-                }
-            }
-        }
         if (::sensorStatusText.isInitialized) {
             sensorStatusText.text = ""
             sensorStatusText.visibility = View.GONE
@@ -2753,6 +2713,58 @@ class MainActivity : Activity(), SensorEventListener {
         } catch (_: Exception) { }
         try { detectionTone?.release(); detectionTone = null } catch (_: Exception) { }
         super.onDestroy()
+    }
+}
+
+/**
+ * 300개의 EMF LED를 Canvas로 직접 렌더링합니다.
+ * 개별 View의 녹색 테두리가 실제 LED 색상을 덮던 문제를 제거합니다.
+ */
+class EmfLedSpectrumView(context: android.content.Context) : View(context) {
+    private val ledCount = 300
+    private var fieldValue = 0f
+    private val ledPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val inactiveColor = Color.rgb(17, 35, 24)
+
+    fun setFieldValue(value: Float) {
+        fieldValue = if (value.isFinite()) value.coerceAtLeast(0f) else 0f
+        invalidate()
+    }
+
+    private fun colorFor(value: Float): Int {
+        val t = ((value - 20f) / 180f).coerceIn(0f, 1f)
+        // 녹색(120°) → 노랑(60°) → 주황(30°) → 빨강(0°)
+        val hue = when {
+            t <= 0.5f -> 120f - (t / 0.5f) * 60f
+            t <= (2f / 3f) -> 60f - ((t - 0.5f) / (1f / 6f)) * 30f
+            else -> 30f - ((t - (2f / 3f)) / (1f / 3f)) * 30f
+        }.coerceIn(0f, 120f)
+        return Color.HSVToColor(floatArrayOf(hue, 1f, 1f))
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        if (width <= 0 || height <= 0) return
+
+        val normalized = ((fieldValue - 20f) / 180f).coerceIn(0f, 1f)
+        val litCount = (normalized * ledCount).roundToInt().coerceIn(0, ledCount)
+        val activeColor = colorFor(fieldValue)
+
+        val gap = (width * 0.0018f).coerceAtLeast(0.45f)
+        val cellWidth = (width - gap * (ledCount - 1)) / ledCount.toFloat()
+        val top = height * 0.20f
+        val bottom = height * 0.80f
+        val radius = (cellWidth * 0.22f).coerceAtMost(height * 0.12f)
+
+        for (i in 0 until ledCount) {
+            ledPaint.color = if (i < litCount) activeColor else inactiveColor
+            ledPaint.alpha = if (i < litCount) 255 else 190
+            val left = i * (cellWidth + gap)
+            canvas.drawRoundRect(
+                left, top, left + cellWidth, bottom,
+                radius, radius, ledPaint
+            )
+        }
     }
 }
 
