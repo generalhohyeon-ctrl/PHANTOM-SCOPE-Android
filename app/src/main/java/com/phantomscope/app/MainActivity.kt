@@ -120,8 +120,8 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var logPreferences: SharedPreferences
     private val investigationRecords = mutableListOf<InvestigationRecord>()
     private var anomalyActive = false
-    private val anomalyTriggerThreshold = 5f
-    private val anomalyResetThreshold = 3.5f
+    private var anomalyTriggerThreshold = 5f
+    private val anomalyResetRatio = 0.70f
     private val maximumSavedRecords = 200
 
     private var audioRecord: AudioRecord? = null
@@ -223,7 +223,7 @@ class MainActivity : Activity(), SensorEventListener {
         header.addView(versionLabel, LinearLayout.LayoutParams(-1, dp(18)))
         root.addView(header, LinearLayout.LayoutParams(-1, -2))
 
-        val tabNames = listOf("⌁\n탐지", "▣\n카메라", "⚙\n설정")
+        val tabNames = listOf("■\n탐지", "■\n카메라", "■\n설정")
 
         val tabRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -235,20 +235,20 @@ class MainActivity : Activity(), SensorEventListener {
         tabButtons = tabNames.mapIndexed { index, name ->
             Button(this).apply {
                 text = name
-                textSize = 12f
+                textSize = 11f
                 isAllCaps = false
                 gravity = Gravity.CENTER
                 typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
                 setLineSpacing(dp(1).toFloat(), 0.9f)
-                setTextColor(Color.LTGRAY)
-                background = roundedBackground(Color.rgb(3, 10, 6), 14)
+                setTextColor(Color.rgb(115, 130, 120))
+                background = roundedBackground(Color.rgb(3, 10, 6), 10)
                 elevation = dp(2).toFloat()
                 setOnClickListener { showPage(index) }
 
                 tabRow.addView(
                     this,
-                    LinearLayout.LayoutParams(0, dp(44), 1f).apply {
-                        setMargins(dp(4), dp(3), dp(4), dp(3))
+                    LinearLayout.LayoutParams(0, dp(48), 1f).apply {
+                        setMargins(dp(5), dp(3), dp(5), dp(3))
                     }
                 )
             }
@@ -294,6 +294,7 @@ class MainActivity : Activity(), SensorEventListener {
         logPreferences = getSharedPreferences("phantom_scope_logs", MODE_PRIVATE)
         soundPreferences = getSharedPreferences("phantom_scope_sound_events", MODE_PRIVATE)
         settingsPreferences = getSharedPreferences("phantom_scope_settings", MODE_PRIVATE)
+        anomalyTriggerThreshold = settingsPreferences?.getFloat("emf_word_threshold_ut", 5f) ?: 5f
         ghostLogPreferences = getSharedPreferences("phantom_scope_word_logs", MODE_PRIVATE)
         loadGhostWordLogs()
         selectedLanguage = settingsPreferences?.getString("ghost_language", "ko") ?: "ko"
@@ -307,62 +308,32 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun createSpectrum(): View {
         val panel = makePanel()
-
-        val label = TextView(this).apply {
-            text = "EMF SIGNAL"
-            textSize = 12f
-            typeface = Typeface.DEFAULT_BOLD
-            letterSpacing = 1.2f
-            setTextColor(Color.LTGRAY)
-        }
-        panel.addView(label)
-
-        // 숫자 대신 색상 LED만으로 강도를 표시합니다.
-        fieldValueText = TextView(this).apply {
-            visibility = View.GONE
-        }
-
+        // EMF 표시부는 숫자나 설명 없이 색상 LED만 표시합니다.
+        fieldValueText = TextView(this).apply { visibility = View.GONE }
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(0, dp(16), 0, dp(12))
+            setPadding(0, dp(14), 0, dp(14))
         }
-
         spectrumSegments.clear()
-        // 300개의 고밀도 LED 셀로 작은 자기장 변화도 세밀하게 표현합니다.
+        // 300개 셀: 초록 -> 노랑 -> 주황 -> 빨강. 각 셀은 고정 색상이며 활성도만 바뀝니다.
         for (index in 0 until 300) {
-            val hue = 120f - (index / 299f) * 120f // green -> yellow -> orange -> red
-            val color = Color.HSVToColor(floatArrayOf(hue.coerceAtLeast(0f), 0.9f, 1f))
+            val fraction = index / 299f
+            val hue = 120f * (1f - fraction) // 120 green to 0 red
+            val color = Color.HSVToColor(floatArrayOf(hue, 0.96f, 1f))
             val segment = View(this).apply {
-                background = roundedBackground(color, 5)
-                alpha = 0.22f
+                background = roundedBackground(color, 3)
+                alpha = 0.14f
             }
             spectrumSegments.add(segment)
-            bar.addView(segment, LinearLayout.LayoutParams(0, dp(25), 1f).apply {
-                setMargins(0, 0, 0, 0)
-            })
+            bar.addView(segment, LinearLayout.LayoutParams(0, dp(24), 1f))
         }
         panel.addView(bar)
         spectrumBar = bar
-
         sensorStatusText = TextView(this).apply {
-            text = if (magneticSensor == null) "MAGNETIC SENSOR NOT SUPPORTED" else "SENSOR CALIBRATING"
-            textSize = 11f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(if (magneticSensor == null) warningColor else accentColor)
-            gravity = Gravity.CENTER
-            setPadding(0, dp(3), 0, 0)
+            text = ""
+            visibility = View.GONE
         }
-        panel.addView(sensorStatusText)
-
-        val legend = TextView(this).apply {
-            text = "LOW                                      HIGH"
-            textSize = 9f
-            setTextColor(Color.GRAY)
-            gravity = Gravity.CENTER
-            setPadding(0, dp(8), 0, 0)
-        }
-        panel.addView(legend)
         return panel
     }
 
@@ -405,7 +376,7 @@ class MainActivity : Activity(), SensorEventListener {
 
         currentValue = magnitude
 
-        updateSpectrum(magnitude)
+        updateSpectrum(if (baselineCount >= 30) abs(magnitude - baseline) else 0f)
 
         readings.add(magnitude)
         if (readings.size > 60) {
@@ -451,8 +422,9 @@ class MainActivity : Activity(), SensorEventListener {
         while (spectrumSamples.size > 4) spectrumSamples.removeFirst()
         smoothedSpectrumValue = spectrumSamples.average().toFloat()
 
-        // 10~100 μT 범위를 300단계로 세분화하여 약 0.3 μT 단위의 변화를 표현합니다.
-        val normalized = ((smoothedSpectrumValue - 10f) / 90f).coerceIn(0f, 1f)
+        // Android 센서값(μT)을 mG로 환산합니다. 표시 범위는 1.5~20 mG입니다.
+        val milligauss = smoothedSpectrumValue * 10f
+        val normalized = ((milligauss - 1.5f) / (20f - 1.5f)).coerceIn(0f, 1f)
         val exactLevel = normalized * spectrumSegments.size
         lastSpectrumLevel = exactLevel.toInt().coerceIn(0, spectrumSegments.size)
         val partial = exactLevel - lastSpectrumLevel
@@ -502,7 +474,7 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun formatField(value: Float): String {
-        return String.format(Locale.US, "%.1f μT", value)
+        return String.format(Locale.US, "%.1f mG", value * 10f)
     }
 
     private fun showPage(index: Int) {
@@ -523,9 +495,9 @@ class MainActivity : Activity(), SensorEventListener {
         if (!cameraFullscreen) {
             tabButtons.forEachIndexed { i, button ->
                 button.background = roundedBackground(
-                    if (i == index) Color.rgb(8, 35, 16) else Color.rgb(3, 10, 6), 14
+                    if (i == index) Color.rgb(8, 35, 16) else Color.rgb(3, 10, 6), 10
                 )
-                button.setTextColor(if (i == index) accentColor else Color.rgb(175, 185, 178))
+                button.setTextColor(if (i == index) accentColor else Color.rgb(95, 110, 100))
                 button.setShadowLayer(if (i == index) dp(8).toFloat() else 0f, 0f, 0f,
                     Color.rgb(30, 255, 75))
             }
@@ -772,6 +744,10 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun requestScreenRecording() {
         if (screenRecording) return
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2102)
+            return
+        }
         try {
             val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             screenCaptureRequestPending = true
@@ -849,6 +825,13 @@ class MainActivity : Activity(), SensorEventListener {
                         text = "CAMERA PERMISSION DENIED"
                         setTextColor(warningColor)
                     }
+                }
+            }
+            2102 -> {
+                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    requestScreenRecording()
+                } else {
+                    Toast.makeText(this, "동영상에 주변 소리를 녹음하려면 마이크 권한이 필요합니다.", Toast.LENGTH_LONG).show()
                 }
             }
             501 -> {
@@ -1044,11 +1027,12 @@ class MainActivity : Activity(), SensorEventListener {
         }
         try {
             val poseSnapshot = capturePoseOverlaySnapshot()
+            val subtitleSnapshot = cameraGhostWordText?.text?.toString()?.takeIf { it.isNotBlank() }
             active.takePicture(null, null) { bytes, sourceCamera ->
                 try {
                     val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                     val displayName = "PHANTOM_$stamp.jpg"
-                    val photoWithOverlay = composePoseOverlayIntoPhoto(bytes, poseSnapshot)
+                    val photoWithOverlay = composePoseOverlayIntoPhoto(bytes, poseSnapshot, subtitleSnapshot)
                     val savedLocation = savePhotoToGallery(photoWithOverlay, displayName)
                     attachEvidenceToLatestRecord(savedLocation.first)
 
@@ -1103,8 +1087,8 @@ class MainActivity : Activity(), SensorEventListener {
         } catch (_: Exception) { null }
     }
 
-    private fun composePoseOverlayIntoPhoto(jpegBytes: ByteArray, poseBitmap: Bitmap?): ByteArray {
-        if (poseBitmap == null || poseBitmap.isRecycled) return jpegBytes
+    private fun composePoseOverlayIntoPhoto(jpegBytes: ByteArray, poseBitmap: Bitmap?, subtitle: String?): ByteArray {
+        if ((poseBitmap == null || poseBitmap.isRecycled) && subtitle.isNullOrBlank()) return jpegBytes
         val decoded = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
             ?: return jpegBytes
         return try {
@@ -1122,16 +1106,31 @@ class MainActivity : Activity(), SensorEventListener {
             } else decoded
 
             val canvas = Canvas(photoBitmap)
-            val srcW = poseBitmap.width.toFloat()
-            val srcH = poseBitmap.height.toFloat()
-            val scale = max(photoBitmap.width / srcW, photoBitmap.height / srcH)
-            val scaledW = srcW * scale
-            val scaledH = srcH * scale
-            val left = (photoBitmap.width - scaledW) / 2f
-            val top = (photoBitmap.height - scaledH) / 2f
-            val dst = RectF(left, top, left + scaledW, top + scaledH)
-            val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-            canvas.drawBitmap(poseBitmap, null, dst, paint)
+            if (poseBitmap != null && !poseBitmap.isRecycled) {
+                val srcW = poseBitmap.width.toFloat()
+                val srcH = poseBitmap.height.toFloat()
+                val scale = max(photoBitmap.width / srcW, photoBitmap.height / srcH)
+                val scaledW = srcW * scale
+                val scaledH = srcH * scale
+                val left = (photoBitmap.width - scaledW) / 2f
+                val top = (photoBitmap.height - scaledH) / 2f
+                val dst = RectF(left, top, left + scaledW, top + scaledH)
+                val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+                canvas.drawBitmap(poseBitmap, null, dst, paint)
+            }
+            if (!subtitle.isNullOrBlank()) {
+                val bandHeight = photoBitmap.height * 0.13f
+                val band = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(185, 0, 0, 0) }
+                canvas.drawRect(0f, photoBitmap.height - bandHeight, photoBitmap.width.toFloat(), photoBitmap.height.toFloat(), band)
+                val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.WHITE
+                    textAlign = Paint.Align.CENTER
+                    typeface = Typeface.create("sans-serif", Typeface.BOLD)
+                    textSize = photoBitmap.width * 0.055f
+                    setShadowLayer(photoBitmap.width * 0.008f, 0f, 0f, Color.BLACK)
+                }
+                canvas.drawText(subtitle, photoBitmap.width / 2f, photoBitmap.height - bandHeight / 2f + textPaint.textSize * 0.34f, textPaint)
+            }
             val output = java.io.ByteArrayOutputStream()
             photoBitmap.compress(Bitmap.CompressFormat.JPEG, 94, output)
             poseBitmap.recycle()
@@ -1229,7 +1228,7 @@ class MainActivity : Activity(), SensorEventListener {
                 investigationRecords.removeAt(0)
             }
             saveInvestigationRecords()
-        } else if (deviation < anomalyResetThreshold) {
+        } else if (deviation < (anomalyTriggerThreshold * anomalyResetRatio)) {
             anomalyActive = false
         }
     }
@@ -1953,7 +1952,7 @@ class MainActivity : Activity(), SensorEventListener {
         summary.addView(count)
 
         val info = TextView(this).apply {
-            text = "자기장 변화량이 ${String.format(Locale.US, "%.1f", anomalyTriggerThreshold)} μT 이상이면 자동 저장됩니다."
+            text = "자기장 변화량이 ${String.format(Locale.US, "%.1f", anomalyTriggerThreshold * 10f)} mG 이상이면 자동 저장됩니다."
             textSize = 11f
             setTextColor(Color.LTGRAY)
             setPadding(0, dp(8), 0, 0)
@@ -1985,7 +1984,7 @@ class MainActivity : Activity(), SensorEventListener {
             addPanelText(
                 "NO SAVED INVESTIGATIONS",
                 "아직 자동 기록된 자기장 변화가 없습니다.\n\n" +
-                    "${String.format(Locale.US, "%.1f", anomalyTriggerThreshold)} μT 이상 변화하면 이곳에 기록됩니다."
+                    "${String.format(Locale.US, "%.1f", anomalyTriggerThreshold * 10f)} mG 이상 변화하면 이곳에 기록됩니다."
             )
             return
         }
@@ -2025,7 +2024,7 @@ class MainActivity : Activity(), SensorEventListener {
                     "수동 증거 자료가 연결된 조사 기록"
                 } else {
                     "FIELD  ${formatField(record.fieldValue)}\\n" +
-                        "DEVIATION  +${String.format(Locale.US, "%.1f", record.deviation)} μT"
+                        "DEVIATION  +${String.format(Locale.US, "%.1f", record.deviation * 10f)} mG"
                 }
                 textSize = 12f
                 setTextColor(Color.WHITE)
@@ -2197,7 +2196,7 @@ class MainActivity : Activity(), SensorEventListener {
                 textSize = 12f; setTextColor(Color.WHITE)
             }
             val right = TextView(this).apply {
-                text = "${item.fieldValue.formatOne()} μT · ${item.level}"
+                text = "${(item.fieldValue * 10f).formatOne()} mG · ${item.level}"
                 textSize = 10f; setTextColor(accentColor); gravity = Gravity.RIGHT
             }
             row.addView(left, LinearLayout.LayoutParams(0, -2, 1f))
@@ -2213,7 +2212,7 @@ class MainActivity : Activity(), SensorEventListener {
     private fun maybeShowGhostWord(deviation: Float) {
         val now = System.currentTimeMillis()
         if (deviation < anomalyTriggerThreshold) {
-            if (deviation < anomalyResetThreshold) ghostWordArmed = true
+            if (deviation < anomalyTriggerThreshold * anomalyResetRatio) ghostWordArmed = true
             return
         }
         if (!ghostWordArmed || now - lastGhostWordTime < ghostWordCooldownMs) return
@@ -2351,7 +2350,6 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun showSettingsPage() {
-        addHeading("어둠의 규칙")
 
         val languagePanel = makePanel()
         val languageTitle = TextView(this).apply {
@@ -2407,6 +2405,45 @@ class MainActivity : Activity(), SensorEventListener {
         }
         voicePanel.addView(voiceSwitch)
         content.addView(voicePanel, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(0, 0, 0, dp(12))
+        })
+
+        val sensitivityPanel = makePanel()
+        val sensitivityTitle = TextView(this).apply {
+            text = "EMF 감지 민감도"
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        }
+        sensitivityPanel.addView(sensitivityTitle)
+        val sensitivityValue = TextView(this).apply {
+            text = "단어 감지 기준  ${String.format(Locale.US, "%.1f", anomalyTriggerThreshold * 10f)} mG"
+            textSize = 12f
+            setTextColor(accentColor)
+            setPadding(0, dp(6), 0, 0)
+        }
+        sensitivityPanel.addView(sensitivityValue)
+        val sensitivitySeek = SeekBar(this).apply {
+            max = 95 // 0.5~10.0 μT = 5~100 mG
+            progress = ((anomalyTriggerThreshold - 0.5f) * 10f).roundToInt().coerceIn(0, max)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    anomalyTriggerThreshold = 0.5f + progress / 10f
+                    sensitivityValue.text = "단어 감지 기준  ${String.format(Locale.US, "%.1f", anomalyTriggerThreshold * 10f)} mG"
+                    if (fromUser) settingsPreferences?.edit()?.putFloat("emf_word_threshold_ut", anomalyTriggerThreshold)?.apply()
+                }
+                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+            })
+        }
+        sensitivityPanel.addView(sensitivitySeek)
+        val sensitivityHint = TextView(this).apply {
+            text = "왼쪽으로 조정할수록 작은 자기장 변화에도 반응합니다."
+            textSize = 11f
+            setTextColor(Color.LTGRAY)
+        }
+        sensitivityPanel.addView(sensitivityHint)
+        content.addView(sensitivityPanel, LinearLayout.LayoutParams(-1, -2).apply {
             setMargins(0, 0, 0, dp(12))
         })
 
@@ -2469,10 +2506,10 @@ class MainActivity : Activity(), SensorEventListener {
             setPadding(0, dp(12), 0, 0)
         }
 
-        currentText = addStatRow(grid, "CURRENT", "-- μT")
-        averageText = addStatRow(grid, "AVERAGE", "-- μT")
-        maximumText = addStatRow(grid, "MAXIMUM", "-- μT")
-        minimumText = addStatRow(grid, "MINIMUM", "-- μT")
+        currentText = addStatRow(grid, "CURRENT", "-- mG")
+        averageText = addStatRow(grid, "AVERAGE", "-- mG")
+        maximumText = addStatRow(grid, "MAXIMUM", "-- mG")
+        minimumText = addStatRow(grid, "MINIMUM", "-- mG")
 
         panel.addView(grid)
         content.addView(panel)
@@ -3144,7 +3181,7 @@ class PhantomScreenRecordingService : Service() {
                     createNotificationChannel()
                     val notification = buildNotification()
                     if (android.os.Build.VERSION.SDK_INT >= 29) {
-                        startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                        startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
                     } else {
                         startForeground(NOTIFICATION_ID, notification)
                     }
@@ -3222,8 +3259,13 @@ class PhantomScreenRecordingService : Service() {
             }
             recorder!!.apply {
                 setVideoSource(MediaRecorder.VideoSource.SURFACE)
+                setAudioSource(MediaRecorder.AudioSource.MIC)
                 setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
                 setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setAudioChannels(1)
+                setAudioSamplingRate(44100)
+                setAudioEncodingBitRate(128000)
                 setVideoSize(width, height)
                 setVideoFrameRate(30)
                 setVideoEncodingBitRate(6_000_000)
@@ -3253,8 +3295,13 @@ class PhantomScreenRecordingService : Service() {
             }
             recorder!!.apply {
                 setVideoSource(MediaRecorder.VideoSource.SURFACE)
+                setAudioSource(MediaRecorder.AudioSource.MIC)
                 setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
                 setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setAudioChannels(1)
+                setAudioSamplingRate(44100)
+                setAudioEncodingBitRate(128000)
                 setVideoSize(width, height)
                 setVideoFrameRate(30)
                 setVideoEncodingBitRate(6_000_000)
