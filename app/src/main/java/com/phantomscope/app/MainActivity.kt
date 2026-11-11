@@ -34,6 +34,7 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.MediaPlayer
+import android.media.ToneGenerator
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.view.ViewGroup
@@ -104,10 +105,11 @@ class MainActivity : Activity(), SensorEventListener {
     private var selectedLanguage = "ko"
     private var ghostSpeechEnabled = true
     private var ghostTts: TextToSpeech? = null
+    private var detectionTone: ToneGenerator? = null
     @Volatile private var ghostTtsReady = false
     private var lastGhostWordTime = 0L
     private var ghostWordArmed = true
-    private val ghostWordCooldownMs = 6500L
+    private var ghostWordCooldownMs = 6500L
     private val spectrumSamples = ArrayDeque<Float>()
     private var smoothedSpectrumValue = 0f
     private var lastSpectrumLevel = 0
@@ -294,6 +296,7 @@ class MainActivity : Activity(), SensorEventListener {
         logPreferences = getSharedPreferences("phantom_scope_logs", MODE_PRIVATE)
         soundPreferences = getSharedPreferences("phantom_scope_sound_events", MODE_PRIVATE)
         settingsPreferences = getSharedPreferences("phantom_scope_settings", MODE_PRIVATE)
+        try { detectionTone = ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 85) } catch (_: Exception) { detectionTone = null }
         val savedSensitivity = settingsPreferences?.getInt("emf_sensitivity_percent", -1) ?: -1
         anomalyTriggerThreshold = if (savedSensitivity >= 0) {
             10f - (savedSensitivity / 99f) * 9.5f
@@ -321,15 +324,12 @@ class MainActivity : Activity(), SensorEventListener {
             setPadding(0, dp(14), 0, dp(14))
         }
         spectrumSegments.clear()
-        // 300개 셀 전체에 초록 -> 노랑 -> 주황 -> 빨강의 고정 그라데이션을 배치합니다.
-        // 기준 자기장 대비 변화량이 커질수록 왼쪽부터 더 많은 셀이 켜집니다.
+        // 300개 셀은 현재 EMF 값에 따라 모두 같은 단계 색으로 켜집니다.
+        // 값이 오르면 실제 점등 색 자체가 녹색 → 노랑 → 주황 → 빨강으로 이동합니다.
         for (index in 0 until 300) {
-            val fraction = index / 299f
-            val hue = 120f * (1f - fraction) // 120 green to 0 red
-            val color = Color.HSVToColor(floatArrayOf(hue, 0.96f, 1f))
             val segment = View(this).apply {
-                background = roundedBackground(color, 3)
-                alpha = 0.14f
+                background = roundedBackground(Color.rgb(35, 65, 42), 3)
+                alpha = 0.10f
             }
             spectrumSegments.add(segment)
             bar.addView(segment, LinearLayout.LayoutParams(0, dp(24), 1f))
@@ -407,26 +407,35 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun updateSpectrum(value: Float) {
-        // 최근 4개 센서값을 평균해 LED 표시를 부드럽게 유지합니다.
         spectrumSamples.addLast(value)
-        while (spectrumSamples.size > 4) spectrumSamples.removeFirst()
+        while (spectrumSamples.size > 3) spectrumSamples.removeFirst()
         smoothedSpectrumValue = spectrumSamples.average().toFloat()
 
-        // 고정 범위: 20 μT에서 첫 LED, 200 μT에서 마지막 LED까지 표시합니다.
-        // 앱 시작 시 별도의 30회 기준 측정은 하지 않습니다.
+        // 고정 표시 범위 20~200 μT. 이 범위 안에서 현재 값에 맞춰 LED 수와 LED 색을 함께 변경합니다.
         val normalized = ((smoothedSpectrumValue - 20f) / 180f).coerceIn(0f, 1f)
         val exactLevel = normalized * spectrumSegments.size
         lastSpectrumLevel = exactLevel.toInt().coerceIn(0, spectrumSegments.size)
+        val hue = 120f * (1f - normalized) // 120° green → 60° yellow → 30° orange → 0° red
+        val activeColor = Color.HSVToColor(floatArrayOf(hue, 0.96f, 1f))
+        val inactiveColor = Color.rgb(24, 38, 28)
         val partial = exactLevel - lastSpectrumLevel
 
         spectrumSegments.forEachIndexed { index, segment ->
-            segment.alpha = when {
-                index < lastSpectrumLevel -> 1f
-                index == lastSpectrumLevel -> 0.22f + partial * 0.78f
-                else -> 0.07f
+            when {
+                index < lastSpectrumLevel -> {
+                    segment.background = roundedBackground(activeColor, 3)
+                    segment.alpha = 1f
+                }
+                index == lastSpectrumLevel && lastSpectrumLevel < spectrumSegments.size -> {
+                    segment.background = roundedBackground(activeColor, 3)
+                    segment.alpha = 0.20f + partial * 0.80f
+                }
+                else -> {
+                    segment.background = roundedBackground(inactiveColor, 3)
+                    segment.alpha = 0.35f
+                }
             }
         }
-
         if (::sensorStatusText.isInitialized) {
             sensorStatusText.text = ""
             sensorStatusText.visibility = View.GONE
@@ -2192,14 +2201,17 @@ class MainActivity : Activity(), SensorEventListener {
             if (deviation < anomalyTriggerThreshold * anomalyResetRatio) ghostWordArmed = true
             return
         }
-        if (!ghostWordArmed || now - lastGhostWordTime < ghostWordCooldownMs) return
+        val sensitivity = (settingsPreferences?.getInt("emf_sensitivity_percent", 49) ?: 49) / 99f
+        val cooldown = (6500L - (sensitivity * 4200L)).toLong().coerceAtLeast(1800L)
+        // 자기장 변화가 계속 유지되어도 쿨다운이 지나면 다시 확률 판정을 합니다.
+        // 이전 구현처럼 기준값 아래로 완전히 내려가야만 재무장되는 문제를 제거합니다.
+        if (now - lastGhostWordTime < cooldown) return
 
-        // 변화가 커질수록 출력 확률을 조금 높이되, 매번 출력하지는 않습니다.
-        val probability = (0.22f + ((deviation - anomalyTriggerThreshold) / 30f))
-            .coerceIn(0.22f, 0.58f)
+        // 민감도가 높을수록 단어 출력 확률이 커지고 재판정 대기시간은 짧아집니다.
+        val probability = (0.18f + sensitivity * 0.55f + ((deviation - anomalyTriggerThreshold) / 35f))
+            .coerceIn(0.18f, 0.90f)
         // 한 번의 감지 구간에서는 확률 판정을 한 번만 수행합니다.
         lastGhostWordTime = now
-        ghostWordArmed = false
         if (Math.random().toFloat() < probability) {
             val words = ghostWordsForLanguage(selectedLanguage)
             val previous = ghostWordText?.text?.toString()
@@ -2207,6 +2219,8 @@ class MainActivity : Activity(), SensorEventListener {
             val chosen = (candidates.ifEmpty { words }).random()
             saveGhostWordLog(chosen, currentValue, deviation)
             runOnUiThread {
+                // 단어가 실제로 출력될 때 짧고 강한 '뜨든' 감지음을 재생합니다.
+                try { detectionTone?.startTone(ToneGenerator.TONE_PROP_BEEP2, 170) } catch (_: Exception) { }
                 val wordColor = when {
                     deviation >= 18f -> Color.rgb(255, 90, 110)
                     deviation >= 10f -> Color.rgb(255, 170, 75)
@@ -2396,7 +2410,387 @@ class MainActivity : Activity(), SensorEventListener {
                 "혼자야",
                 "누가 왔어",
                 "무슨 일이야",
-                "괜찮니"
+                "괜찮니",
+                "물 먹어",
+                "물 마셔",
+                "물 줘",
+                "물 받아",
+                "물 가져와",
+                "물 놓아",
+                "물 열어",
+                "물 닫아",
+                "물 켜",
+                "물 꺼",
+                "물 앉아",
+                "물 일어나",
+                "물 와",
+                "물 가",
+                "물 봐",
+                "물 들어와",
+                "물 나가",
+                "물 기다려",
+                "물 찾아",
+                "물 전화해",
+                "물 알려줘",
+                "물 보여줘",
+                "물 들어봐",
+                "물 읽어",
+                "물 써",
+                "물 씻어",
+                "물 닦아",
+                "물 치워",
+                "물 정리해",
+                "물 청소해",
+                "물 요리해",
+                "물 쉬어",
+                "물 자",
+                "물 걸어",
+                "물 뛰어",
+                "물 멈춰",
+                "물 시작해",
+                "물 끝내",
+                "물 다시",
+                "물 해",
+                "물 확인해",
+                "물 기억해",
+                "물 잊어",
+                "물 조심해",
+                "물 도와줘",
+                "물 말해",
+                "물 웃어",
+                "물 울어",
+                "물 대답해",
+                "물 물어봐",
+                "물 선택해",
+                "물 골라",
+                "물 바꿔",
+                "물 켜줘",
+                "물 꺼줘",
+                "물 잡아",
+                "물 놔",
+                "물 보내",
+                "물 불러",
+                "물 돌아와",
+                "물 출발해",
+                "물 도착해",
+                "물 열어봐",
+                "물 닫아봐",
+                "물 찾아봐",
+                "물 들어가",
+                "물 나와",
+                "물 따라와",
+                "물 비켜",
+                "물 앉아봐",
+                "물 일어나봐",
+                "물 움직여",
+                "물 가만있어",
+                "물 가까이",
+                "물 멀리",
+                "물 손",
+                "물 눈",
+                "물 감아",
+                "물 떠",
+                "물 고개",
+                "물 들어",
+                "물 숙여",
+                "물 뒤돌아봐",
+                "물 앞을",
+                "밥 먹어",
+                "밥 마셔",
+                "밥 줘",
+                "밥 받아",
+                "밥 가져와",
+                "밥 놓아",
+                "밥 열어",
+                "밥 닫아",
+                "밥 켜",
+                "밥 꺼",
+                "밥 앉아",
+                "밥 일어나",
+                "밥 와",
+                "밥 가",
+                "밥 봐",
+                "밥 들어와",
+                "밥 나가",
+                "밥 기다려",
+                "밥 찾아",
+                "밥 전화해",
+                "밥 알려줘",
+                "밥 보여줘",
+                "밥 들어봐",
+                "밥 읽어",
+                "밥 써",
+                "밥 씻어",
+                "밥 닦아",
+                "밥 치워",
+                "밥 정리해",
+                "밥 청소해",
+                "밥 요리해",
+                "밥 쉬어",
+                "밥 자",
+                "밥 걸어",
+                "밥 뛰어",
+                "밥 멈춰",
+                "밥 시작해",
+                "밥 끝내",
+                "밥 다시",
+                "밥 해",
+                "밥 확인해",
+                "밥 기억해",
+                "밥 잊어",
+                "밥 조심해",
+                "밥 도와줘",
+                "밥 말해",
+                "밥 웃어",
+                "밥 울어",
+                "밥 대답해",
+                "밥 물어봐",
+                "밥 선택해",
+                "밥 골라",
+                "밥 바꿔",
+                "밥 켜줘",
+                "밥 꺼줘",
+                "밥 잡아",
+                "밥 놔",
+                "밥 보내",
+                "밥 불러",
+                "밥 돌아와",
+                "밥 출발해",
+                "밥 도착해",
+                "밥 열어봐",
+                "밥 닫아봐",
+                "밥 찾아봐",
+                "밥 들어가",
+                "밥 나와",
+                "밥 따라와",
+                "밥 비켜",
+                "밥 앉아봐",
+                "밥 일어나봐",
+                "밥 움직여",
+                "밥 가만있어",
+                "밥 가까이",
+                "밥 멀리",
+                "밥 손",
+                "밥 눈",
+                "밥 감아",
+                "밥 떠",
+                "밥 고개",
+                "밥 들어",
+                "밥 숙여",
+                "밥 뒤돌아봐",
+                "밥 앞을",
+                "빵 먹어",
+                "빵 마셔",
+                "빵 줘",
+                "빵 받아",
+                "빵 가져와",
+                "빵 놓아",
+                "빵 열어",
+                "빵 닫아",
+                "빵 켜",
+                "빵 꺼",
+                "빵 앉아",
+                "빵 일어나",
+                "빵 와",
+                "빵 가",
+                "빵 봐",
+                "빵 들어와",
+                "빵 나가",
+                "빵 기다려",
+                "빵 찾아",
+                "빵 전화해",
+                "빵 알려줘",
+                "빵 보여줘",
+                "빵 들어봐",
+                "빵 읽어",
+                "빵 써",
+                "빵 씻어",
+                "빵 닦아",
+                "빵 치워",
+                "빵 정리해",
+                "빵 청소해",
+                "빵 요리해",
+                "빵 쉬어",
+                "빵 자",
+                "빵 걸어",
+                "빵 뛰어",
+                "빵 멈춰",
+                "빵 시작해",
+                "빵 끝내",
+                "빵 다시",
+                "빵 해",
+                "빵 확인해",
+                "빵 기억해",
+                "빵 잊어",
+                "빵 조심해",
+                "빵 도와줘",
+                "빵 말해",
+                "빵 웃어",
+                "빵 울어",
+                "빵 대답해",
+                "빵 물어봐",
+                "빵 선택해",
+                "빵 골라",
+                "빵 바꿔",
+                "빵 켜줘",
+                "빵 꺼줘",
+                "빵 잡아",
+                "빵 놔",
+                "빵 보내",
+                "빵 불러",
+                "빵 돌아와",
+                "빵 출발해",
+                "빵 도착해",
+                "빵 열어봐",
+                "빵 닫아봐",
+                "빵 찾아봐",
+                "빵 들어가",
+                "빵 나와",
+                "빵 따라와",
+                "빵 비켜",
+                "빵 앉아봐",
+                "빵 일어나봐",
+                "빵 움직여",
+                "빵 가만있어",
+                "빵 가까이",
+                "빵 멀리",
+                "빵 손",
+                "빵 눈",
+                "빵 감아",
+                "빵 떠",
+                "빵 고개",
+                "빵 들어",
+                "빵 숙여",
+                "빵 뒤돌아봐",
+                "빵 앞을",
+                "우유 먹어",
+                "우유 마셔",
+                "우유 줘",
+                "우유 받아",
+                "우유 가져와",
+                "우유 놓아",
+                "우유 열어",
+                "우유 닫아",
+                "우유 켜",
+                "우유 꺼",
+                "우유 앉아",
+                "우유 일어나",
+                "우유 와",
+                "우유 가",
+                "우유 봐",
+                "우유 들어와",
+                "우유 나가",
+                "우유 기다려",
+                "우유 찾아",
+                "우유 전화해",
+                "우유 알려줘",
+                "우유 보여줘",
+                "우유 들어봐",
+                "우유 읽어",
+                "우유 써",
+                "우유 씻어",
+                "우유 닦아",
+                "우유 치워",
+                "우유 정리해",
+                "우유 청소해",
+                "우유 요리해",
+                "우유 쉬어",
+                "우유 자",
+                "우유 걸어",
+                "우유 뛰어",
+                "우유 멈춰",
+                "우유 시작해",
+                "우유 끝내",
+                "우유 다시",
+                "우유 해",
+                "우유 확인해",
+                "우유 기억해",
+                "우유 잊어",
+                "우유 조심해",
+                "우유 도와줘",
+                "우유 말해",
+                "우유 웃어",
+                "우유 울어",
+                "우유 대답해",
+                "우유 물어봐",
+                "우유 선택해",
+                "우유 골라",
+                "우유 바꿔",
+                "우유 켜줘",
+                "우유 꺼줘",
+                "우유 잡아",
+                "우유 놔",
+                "우유 보내",
+                "우유 불러",
+                "우유 돌아와",
+                "우유 출발해",
+                "우유 도착해",
+                "우유 열어봐",
+                "우유 닫아봐",
+                "우유 찾아봐",
+                "우유 들어가",
+                "우유 나와",
+                "우유 따라와",
+                "우유 비켜",
+                "우유 앉아봐",
+                "우유 일어나봐",
+                "우유 움직여",
+                "우유 가만있어",
+                "우유 가까이",
+                "우유 멀리",
+                "우유 손",
+                "우유 눈",
+                "우유 감아",
+                "우유 떠",
+                "우유 고개",
+                "우유 들어",
+                "우유 숙여",
+                "우유 뒤돌아봐",
+                "우유 앞을",
+                "커피 먹어",
+                "커피 마셔",
+                "커피 줘",
+                "커피 받아",
+                "커피 가져와",
+                "커피 놓아",
+                "커피 열어",
+                "커피 닫아",
+                "커피 켜",
+                "커피 꺼",
+                "커피 앉아",
+                "커피 일어나",
+                "커피 와",
+                "커피 가",
+                "커피 봐",
+                "커피 들어와",
+                "커피 나가",
+                "커피 기다려",
+                "커피 찾아",
+                "커피 전화해",
+                "커피 알려줘",
+                "커피 보여줘",
+                "커피 들어봐",
+                "커피 읽어",
+                "커피 써",
+                "커피 씻어",
+                "커피 닦아",
+                "커피 치워",
+                "커피 정리해",
+                "커피 청소해",
+                "커피 요리해",
+                "커피 쉬어",
+                "커피 자",
+                "커피 걸어",
+                "커피 뛰어",
+                "커피 멈춰",
+                "커피 시작해",
+                "커피 끝내",
+                "커피 다시",
+                "커피 해",
+                "커피 확인해",
+                "커피 기억해",
+                "커피 잊어",
+                "커피 조심해"
             )
         }
     }
@@ -2727,6 +3121,7 @@ class MainActivity : Activity(), SensorEventListener {
             ghostTts = null
             ghostTtsReady = false
         } catch (_: Exception) { }
+        try { detectionTone?.release(); detectionTone = null } catch (_: Exception) { }
         super.onDestroy()
     }
 }
