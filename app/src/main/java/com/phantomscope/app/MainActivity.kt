@@ -321,7 +321,8 @@ class MainActivity : Activity(), SensorEventListener {
             setPadding(0, dp(14), 0, dp(14))
         }
         spectrumSegments.clear()
-        // 300개 셀: 초록 -> 노랑 -> 주황 -> 빨강. 각 셀은 고정 색상이며 활성도만 바뀝니다.
+        // 300개 셀 전체에 초록 -> 노랑 -> 주황 -> 빨강의 고정 그라데이션을 배치합니다.
+        // 기준 자기장 대비 변화량이 커질수록 왼쪽부터 더 많은 셀이 켜집니다.
         for (index in 0 until 300) {
             val fraction = index / 299f
             val hue = 120f * (1f - fraction) // 120 green to 0 red
@@ -394,72 +395,41 @@ class MainActivity : Activity(), SensorEventListener {
 
         updateStatistics()
 
-        if (baselineCount < 30) {
-            baselineTotal += magnitude
-            baselineCount++
-
-            if (baselineCount == 30) {
-                baseline = baselineTotal / baselineCount
-            }
-
-            if (::radarView.isInitialized) {
-                radarView.setCalibration(
-                    baselineCount.toFloat() / 30f
-                )
-            }
-        } else {
-            val deviation = abs(magnitude - baseline)
-
-            if (::radarView.isInitialized) {
-                radarView.updateData(deviation, x, y)
-            }
-
-            if (detectionRunning) {
-                handleAnomaly(deviation, magnitude)
-                maybeShowGhostWord(deviation)
-            }
+        // 자동 기준 측정은 하지 않습니다. 감지 판정은 고정 시작점 20 μT 기준입니다.
+        val deviation = abs(magnitude - 20f)
+        if (::radarView.isInitialized) {
+            radarView.updateData(deviation, x, y)
+        }
+        if (detectionRunning) {
+            handleAnomaly(deviation, magnitude)
+            maybeShowGhostWord(deviation)
         }
     }
 
     private fun updateSpectrum(value: Float) {
-        // 4개 샘플만 평균내어 반응성을 높이고, 인위적인 흔들림은 사용하지 않습니다.
+        // 최근 4개 센서값을 평균해 LED 표시를 부드럽게 유지합니다.
         spectrumSamples.addLast(value)
         while (spectrumSamples.size > 4) spectrumSamples.removeFirst()
         smoothedSpectrumValue = spectrumSamples.average().toFloat()
 
-        // 일상적인 지구 자기장 범위에서 시작해 절대 자기장 강도를 표시합니다.
-        // 25 μT부터 75 μT까지 LED가 녹색 → 노랑 → 주황 → 빨강으로 채워집니다.
-        val normalized = ((smoothedSpectrumValue - 25f) / (75f - 25f)).coerceIn(0f, 1f)
+        // 고정 범위: 20 μT에서 첫 LED, 200 μT에서 마지막 LED까지 표시합니다.
+        // 앱 시작 시 별도의 30회 기준 측정은 하지 않습니다.
+        val normalized = ((smoothedSpectrumValue - 20f) / 180f).coerceIn(0f, 1f)
         val exactLevel = normalized * spectrumSegments.size
         lastSpectrumLevel = exactLevel.toInt().coerceIn(0, spectrumSegments.size)
         val partial = exactLevel - lastSpectrumLevel
+
         spectrumSegments.forEachIndexed { index, segment ->
-            val strength = when {
+            segment.alpha = when {
                 index < lastSpectrumLevel -> 1f
                 index == lastSpectrumLevel -> 0.22f + partial * 0.78f
-                else -> 0.12f
+                else -> 0.07f
             }
-            segment.alpha = strength
         }
 
-        val status = when {
-            magneticSensor == null -> "SENSOR UNAVAILABLE"
-            baselineCount < 30 -> "CALIBRATING SENSOR"
-            normalized < 0.25f -> "LOW FIELD"
-            normalized < 0.50f -> "MODERATE FIELD"
-            normalized < 0.75f -> "HIGH FIELD"
-            else -> "EXTREME FIELD"
-        }
         if (::sensorStatusText.isInitialized) {
-            sensorStatusText.text = status
-            sensorStatusText.setTextColor(
-                when {
-                    normalized < 0.25f -> Color.rgb(70, 220, 130)
-                    normalized < 0.50f -> Color.rgb(220, 220, 65)
-                    normalized < 0.75f -> Color.rgb(255, 145, 45)
-                    else -> Color.rgb(255, 45, 35)
-                }
-            )
+            sensorStatusText.text = ""
+            sensorStatusText.visibility = View.GONE
         }
     }
 
@@ -610,8 +580,10 @@ class MainActivity : Activity(), SensorEventListener {
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(accentColor)
         }
+        // 상단의 CAMERA / 모션캡처 상태 문구는 화면에서 숨깁니다.
+        // 상태 텍스트 객체는 오류 처리 코드와의 호환성을 위해 유지하되 레이아웃에는 추가하지 않습니다.
+        status.visibility = View.GONE
         cameraStatusText = status
-        topBar.addView(status, LinearLayout.LayoutParams(0, -2, 1f))
         val exitButton = Button(this).apply {
             text = "나가기 ✕"
             textSize = 12f
@@ -2229,8 +2201,7 @@ class MainActivity : Activity(), SensorEventListener {
         lastGhostWordTime = now
         ghostWordArmed = false
         if (Math.random().toFloat() < probability) {
-            val freeWords = ghostWordsForLanguage(selectedLanguage)
-            val words = if (selectedLanguage == "ko") (freeWords + premiumGhostWordPack()).distinct() else freeWords
+            val words = ghostWordsForLanguage(selectedLanguage)
             val previous = ghostWordText?.text?.toString()
             val candidates = words.filter { it != previous }
             val chosen = (candidates.ifEmpty { words }).random()
@@ -2299,23 +2270,133 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun ghostWordsForLanguage(language: String): List<String> {
-        // 한국어 기본 단어 100개. 다른 언어는 해당 언어의 기본 단어 목록을 사용합니다.
+        // 한국어 일상생활 기본 단어 120개. 다른 언어는 해당 언어의 기본 단어 목록을 사용합니다.
         return when (language) {
             "en" -> listOf("HELP", "LEAVE", "BEHIND", "WHO", "RUN", "DANGER", "HERE", "WHY", "COLD", "STOP", "COME", "NO", "GO AWAY", "DON'T MOVE", "LOOK BACK", "I'M HERE", "LISTEN", "HIDE", "FOUND YOU", "GOODBYE")
             "ja" -> listOf("たすけて", "にげて", "うしろ", "だれ", "あぶない", "ここ", "なぜ", "さむい", "やめて", "きて", "いかないで", "みて", "きこえる", "かくれて", "みつけた")
             "zh" -> listOf("救命", "离开", "身后", "谁", "危险", "这里", "为什么", "冷", "停止", "过来", "不要走", "看后面", "听着", "躲起来", "我看见你了")
             "es" -> listOf("AYUDA", "VETE", "DETRÁS", "QUIÉN", "PELIGRO", "AQUÍ", "POR QUÉ", "FRÍO", "PARA", "VEN", "NO TE VAYAS", "MIRA ATRÁS", "ESCUCHA", "ESCÓNDETE", "TE ENCONTRÉ")
             else -> listOf(
-                "도와줘", "살려줘", "여기", "여기야", "저기", "뒤에", "뒤돌아봐", "누구야", "누가 있어", "가지 마",
-                "가지마", "그만해", "멈춰", "도망쳐", "숨지 마", "숨었어", "찾아봐", "찾았다", "보고 있어", "보고 있어요",
-                "듣고 있어", "들려", "소리가 나", "조용히", "쉿", "왜", "누구", "어디야", "어디 있어", "이리 와",
-                "가까이 와", "저리 가", "나가", "들어와", "문 열어", "문 닫아", "창문", "복도", "계단", "지하실",
-                "천장", "벽 뒤", "침대 밑", "옷장 안", "어둠 속", "그림자", "검은 그림자", "발자국", "발소리", "노크 소리",
-                "속삭임", "숨소리", "울음소리", "웃음소리", "기척", "차가워", "추워", "춥다", "뜨거워", "아파",
-                "무서워", "외로워", "혼자야", "혼자가 아니야", "나를 봐", "눈을 감아", "눈을 떠", "돌아와", "기다려", "기억해",
-                "잊지 마", "내 이름", "이름을 말해", "말해 봐", "대답해", "응답해", "침묵", "위험해", "위험", "살아 있어",
-                "죽지 않았어", "끝나지 않았어", "끝났어", "이제 가", "곧 와", "가까워", "멀어", "따라와", "혼령", "귀신",
-                "유령", "악몽", "저주", "봉인", "문턱", "이곳에 있어", "여기에 있어", "안녕", "잘 가", "안 돼"
+                "안녕",
+                "안녕하세요",
+                "고마워",
+                "감사해",
+                "미안해",
+                "괜찮아",
+                "좋아",
+                "싫어",
+                "맞아",
+                "아니야",
+                "그래",
+                "왜",
+                "뭐야",
+                "누구야",
+                "어디야",
+                "여기",
+                "저기",
+                "이쪽",
+                "저쪽",
+                "잠깐",
+                "기다려",
+                "빨리",
+                "천천히",
+                "조심해",
+                "도와줘",
+                "부탁해",
+                "말해줘",
+                "들려",
+                "보여",
+                "알겠어",
+                "몰라",
+                "기억해",
+                "잊었어",
+                "찾았어",
+                "찾아줘",
+                "왔어",
+                "갈게",
+                "가지 마",
+                "다녀와",
+                "돌아와",
+                "문 열어",
+                "문 닫아",
+                "불 켜",
+                "불 꺼",
+                "앉아",
+                "일어나",
+                "가까이 와",
+                "잠깐만",
+                "그만해",
+                "멈춰",
+                "시작해",
+                "끝났어",
+                "다시 해",
+                "한 번 더",
+                "왼쪽",
+                "오른쪽",
+                "앞에",
+                "뒤에",
+                "위에",
+                "아래",
+                "안에",
+                "밖에",
+                "옆에",
+                "건너편",
+                "방 안",
+                "복도",
+                "계단",
+                "현관",
+                "창문",
+                "문 앞",
+                "소리",
+                "목소리",
+                "발소리",
+                "노크",
+                "웃음",
+                "울음",
+                "바람",
+                "물소리",
+                "불빛",
+                "그림자",
+                "사람",
+                "아이",
+                "친구",
+                "가족",
+                "엄마",
+                "아빠",
+                "형",
+                "누나",
+                "동생",
+                "이름",
+                "전화",
+                "사진",
+                "카메라",
+                "시계",
+                "열쇠",
+                "가방",
+                "의자",
+                "책상",
+                "침대",
+                "휴대폰",
+                "춥다",
+                "덥다",
+                "어두워",
+                "밝아",
+                "조용해",
+                "시끄러워",
+                "무서워",
+                "피곤해",
+                "배고파",
+                "목말라",
+                "여보세요",
+                "잘 자",
+                "잘 가",
+                "또 봐",
+                "여기 있어",
+                "같이 가",
+                "혼자야",
+                "누가 왔어",
+                "무슨 일이야",
+                "괜찮니"
             )
         }
     }
