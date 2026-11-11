@@ -145,6 +145,7 @@ class MainActivity : Activity(), SensorEventListener {
     private var cameraSurfaceHolder: SurfaceHolder? = null
     private var cameraNightOverlay: View? = null
     private var cameraStatusText: TextView? = null
+    private var cameraGhostWordText: TextView? = null
     private var cameraControlsView: LinearLayout? = null
     private var cameraExitButton: Button? = null
     private var screenRecording = false
@@ -281,7 +282,7 @@ class MainActivity : Activity(), SensorEventListener {
         val panel = makePanel()
 
         val label = TextView(this).apply {
-            text = "EMF SIGNAL STRENGTH"
+            text = "EMF SIGNAL"
             textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
             letterSpacing = 1.2f
@@ -301,20 +302,17 @@ class MainActivity : Activity(), SensorEventListener {
         }
 
         spectrumSegments.clear()
-        for (index in 0 until 12) {
-            val hue = when (index) {
-                in 0..3 -> 120f - index * 20f       // green -> yellow
-                in 4..7 -> 60f - (index - 3) * 15f // yellow -> red
-                else -> 300f - (index - 7) * 5f    // red -> violet
-            }
+        // 300개의 고밀도 LED 셀로 작은 자기장 변화도 세밀하게 표현합니다.
+        for (index in 0 until 300) {
+            val hue = 120f - (index / 299f) * 270f // green -> yellow -> red -> violet
             val color = Color.HSVToColor(floatArrayOf(hue.coerceAtLeast(0f), 0.9f, 1f))
             val segment = View(this).apply {
                 background = roundedBackground(color, 5)
                 alpha = 0.22f
             }
             spectrumSegments.add(segment)
-            bar.addView(segment, LinearLayout.LayoutParams(0, dp(28), 1f).apply {
-                setMargins(dp(2), 0, dp(2), 0)
+            bar.addView(segment, LinearLayout.LayoutParams(0, dp(25), 1f).apply {
+                setMargins(0, 0, 0, 0)
             })
         }
         panel.addView(bar)
@@ -360,6 +358,7 @@ class MainActivity : Activity(), SensorEventListener {
         // Keep the camera alive until the permission result returns.
         if (!screenCaptureRequestPending) {
             cameraPageVisible = false
+            cameraGhostWordText = null
             releaseCamera()
             closePoseDetector()
         }
@@ -418,51 +417,40 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun updateSpectrum(value: Float) {
-        // 최근 센서값을 평균 내어 색상 단계가 너무 빠르게 흔들리지 않도록 합니다.
+        // 4개 샘플만 평균내어 반응성을 높이고, 인위적인 흔들림은 사용하지 않습니다.
         spectrumSamples.addLast(value)
-        while (spectrumSamples.size > 12) spectrumSamples.removeFirst()
+        while (spectrumSamples.size > 4) spectrumSamples.removeFirst()
         smoothedSpectrumValue = spectrumSamples.average().toFloat()
 
-        // 완전히 고정된 계기판처럼 보이지 않도록 센서 변화에 비례한 아주 미세한 흔들림
-        val deviationForMotion = if (baselineCount >= 30) abs(value - baseline) else 0f
-        val motionStrength = (deviationForMotion / 18f).coerceIn(0f, 1f)
-        spectrumBar?.let { bar ->
-            val phase = System.currentTimeMillis() / 95.0
-            bar.translationX = (sin(phase) * 1.8f * motionStrength).toFloat()
-            bar.translationY = (cos(phase * 0.83) * 1.0f * motionStrength).toFloat()
-            bar.rotation = (sin(phase * 0.65) * 0.22f * motionStrength).toFloat()
-        }
-
-        // 기존 기기의 일반적인 자기장 범위(약 25~120 μT)를 12단계 LED로 표시합니다.
-        val normalized = ((smoothedSpectrumValue - 25f) / 95f).coerceIn(0f, 1f)
-        val targetLevel = (normalized * 12f).roundToInt().coerceIn(0, 12)
-
-        // 작은 흔들림은 무시해 표시가 깜빡이지 않도록 히스테리시스를 적용합니다.
-        if (targetLevel > lastSpectrumLevel) {
-            if (normalized * 12f >= lastSpectrumLevel + 0.65f) lastSpectrumLevel = targetLevel
-        } else if (targetLevel < lastSpectrumLevel) {
-            if (normalized * 12f <= lastSpectrumLevel - 0.85f) lastSpectrumLevel = targetLevel
-        }
-
+        // 20~100 μT 범위를 300단계로 세분화하여 약 0.27 μT 단위의 변화를 표현합니다.
+        val normalized = ((smoothedSpectrumValue - 20f) / 80f).coerceIn(0f, 1f)
+        val exactLevel = normalized * spectrumSegments.size
+        lastSpectrumLevel = exactLevel.toInt().coerceIn(0, spectrumSegments.size)
+        val partial = exactLevel - lastSpectrumLevel
         spectrumSegments.forEachIndexed { index, segment ->
-            segment.alpha = if (index < lastSpectrumLevel) 1f else 0.18f
+            val strength = when {
+                index < lastSpectrumLevel -> 1f
+                index == lastSpectrumLevel -> 0.22f + partial * 0.78f
+                else -> 0.12f
+            }
+            segment.alpha = strength
         }
 
         val status = when {
             magneticSensor == null -> "SENSOR UNAVAILABLE"
             baselineCount < 30 -> "CALIBRATING SENSOR"
-            lastSpectrumLevel <= 3 -> "LOW FIELD"
-            lastSpectrumLevel <= 6 -> "MODERATE FIELD"
-            lastSpectrumLevel <= 9 -> "HIGH FIELD"
+            normalized < 0.25f -> "LOW FIELD"
+            normalized < 0.50f -> "MODERATE FIELD"
+            normalized < 0.75f -> "HIGH FIELD"
             else -> "EXTREME FIELD"
         }
         if (::sensorStatusText.isInitialized) {
             sensorStatusText.text = status
             sensorStatusText.setTextColor(
                 when {
-                    lastSpectrumLevel <= 3 -> Color.rgb(70, 220, 130)
-                    lastSpectrumLevel <= 6 -> Color.rgb(220, 220, 65)
-                    lastSpectrumLevel <= 9 -> Color.rgb(255, 145, 45)
+                    normalized < 0.25f -> Color.rgb(70, 220, 130)
+                    normalized < 0.50f -> Color.rgb(220, 220, 65)
+                    normalized < 0.75f -> Color.rgb(255, 145, 45)
                     else -> Color.rgb(220, 65, 170)
                 }
             )
@@ -491,6 +479,7 @@ class MainActivity : Activity(), SensorEventListener {
     private fun showPage(index: Int) {
         if (index != 1) {
             cameraPageVisible = false
+            cameraGhostWordText = null
             releaseCamera()
             closePoseDetector()
             if (cameraFullscreen) {
@@ -575,6 +564,26 @@ class MainActivity : Activity(), SensorEventListener {
         val poseView = PoseOverlayView(this)
         poseOverlay = poseView
         previewFrame.addView(poseView, FrameLayout.LayoutParams(-1, -1))
+
+        // EMF 탭과 동일한 감지 결과를 카메라 화면에도 실시간 표시합니다.
+        val cameraWordOverlay = TextView(this).apply {
+            text = ""
+            textSize = 27f
+            typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
+            setTextColor(accentColor)
+            gravity = Gravity.CENTER
+            setShadowLayer(dp(12).toFloat(), 0f, 0f, Color.BLACK)
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+            setBackgroundColor(Color.argb(105, 0, 0, 0))
+            visibility = View.GONE
+            isClickable = false
+            isFocusable = false
+        }
+        cameraGhostWordText = cameraWordOverlay
+        previewFrame.addView(
+            cameraWordOverlay,
+            FrameLayout.LayoutParams(-1, -2, Gravity.CENTER)
+        )
         cameraRoot.addView(previewFrame, FrameLayout.LayoutParams(-1, -1))
 
         val topBar = LinearLayout(this).apply {
@@ -584,7 +593,7 @@ class MainActivity : Activity(), SensorEventListener {
             setBackgroundColor(Color.argb(150, 5, 10, 14))
         }
         val status = TextView(this).apply {
-            text = "CAMERA STANDBY"
+            text = "CAMERA"
             textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(accentColor)
@@ -675,7 +684,7 @@ class MainActivity : Activity(), SensorEventListener {
             }
         }
         val captureButton = Button(this).apply {
-            text = "증거 사진 촬영"
+            text = "무료 사진 촬영"
             textSize = 11f
             isAllCaps = false
             setTextColor(Color.WHITE)
@@ -688,7 +697,9 @@ class MainActivity : Activity(), SensorEventListener {
             isAllCaps = false
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.rgb(155, 45, 45))
-            setOnClickListener { requestScreenRecording() }
+            setOnClickListener {
+                requestScreenRecording()
+            }
         }
         secondRow.addView(flashButton, LinearLayout.LayoutParams(0, dp(48), 0.8f))
         secondRow.addView(captureButton, LinearLayout.LayoutParams(0, dp(48), 1.1f))
@@ -755,7 +766,7 @@ class MainActivity : Activity(), SensorEventListener {
                 cameraControlsView?.visibility = View.GONE
                 cameraExitButton?.text = "녹화 종료"
                 cameraStatusText?.apply {
-                    text = "● REC  |  모션캡쳐 포함 녹화 중"
+                    text = "● REC  |  기록 중"
                     setTextColor(Color.RED)
                 }
                 Toast.makeText(this, "화면 녹화를 시작했습니다. 모션캡쳐 화면이 영상에 포함됩니다.", Toast.LENGTH_LONG).show()
@@ -890,7 +901,7 @@ class MainActivity : Activity(), SensorEventListener {
             }
             opened.startPreview()
             cameraStatusText?.apply {
-                text = if (useFrontCamera) "FRONT CAMERA ACTIVE" else "REAR CAMERA ACTIVE"
+                text = if (useFrontCamera) "뒤를 확인하라" else "앞을 응시하라"
                 setTextColor(accentColor)
             }
             applyCameraPreviewFilter()
@@ -2023,7 +2034,7 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun showRadarPage() {
-        addHeading("EMF PANORAMA")
+        addHeading("EMF DETECTOR")
 
         val spectrumPanel = createSpectrum()
         content.addView(spectrumPanel, LinearLayout.LayoutParams(-1, -2).apply {
@@ -2035,7 +2046,7 @@ class MainActivity : Activity(), SensorEventListener {
             setPadding(dp(18), dp(24), dp(18), dp(24))
         }
         val wordCaption = TextView(this).apply {
-            text = "PARANORMAL WORD RESPONSE"
+            text = "감지 단어"
             textSize = 10f
             letterSpacing = 1.5f
             typeface = Typeface.DEFAULT_BOLD
@@ -2045,7 +2056,7 @@ class MainActivity : Activity(), SensorEventListener {
         wordPanel.addView(wordCaption)
 
         ghostWordText = TextView(this).apply {
-            text = "주변을 탐색하고 있습니다..."
+            text = "대기 중"
             textSize = 29f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(accentColor)
@@ -2055,7 +2066,7 @@ class MainActivity : Activity(), SensorEventListener {
         wordPanel.addView(ghostWordText)
 
         val hint = TextView(this).apply {
-            text = "자기장 변화가 감지되면 확률적으로 단어가 나타납니다."
+            text = "단어 및 음성 출력"
             textSize = 10f
             setTextColor(Color.LTGRAY)
             gravity = Gravity.CENTER
@@ -2066,9 +2077,8 @@ class MainActivity : Activity(), SensorEventListener {
         })
 
         addPanelText(
-            "EMF FIELD",
-            "가로형 색상 파노라마가 자기장 센서의 변화를 보여줍니다. 기기의 방향이나 주변 전자기기 등에 따라서도 값이 달라질 수 있습니다.\n\n" +
-                "단어 출력은 센서 변화에 반응하는 무작위 연출이며 실제 음성이나 초자연 현상을 검출하는 기능은 아닙니다."
+            "EMF",
+            "자기장 변화 감지"
         )
     }
 
@@ -2087,23 +2097,26 @@ class MainActivity : Activity(), SensorEventListener {
         lastGhostWordTime = now
         ghostWordArmed = false
         if (Math.random().toFloat() < probability) {
-            val words = ghostWordsForLanguage(selectedLanguage)
+            val freeWords = ghostWordsForLanguage(selectedLanguage)
+            val words = if (selectedLanguage == "ko") (freeWords + premiumGhostWordPack()).distinct() else freeWords
             val previous = ghostWordText?.text?.toString()
             val candidates = words.filter { it != previous }
             val chosen = (candidates.ifEmpty { words }).random()
             runOnUiThread {
-                ghostWordText?.apply {
-                    text = chosen
-                    setTextColor(
-                        when {
-                            deviation >= 18f -> Color.rgb(255, 90, 110)
-                            deviation >= 10f -> Color.rgb(255, 170, 75)
-                            else -> accentColor
-                        }
-                    )
-                    scaleX = 0.92f
-                    scaleY = 0.92f
-                    animate().scaleX(1f).scaleY(1f).setDuration(260L).start()
+                val wordColor = when {
+                    deviation >= 18f -> Color.rgb(255, 90, 110)
+                    deviation >= 10f -> Color.rgb(255, 170, 75)
+                    else -> accentColor
+                }
+                listOfNotNull(ghostWordText, cameraGhostWordText).forEach { wordView ->
+                    wordView.apply {
+                        text = chosen
+                        setTextColor(wordColor)
+                        visibility = View.VISIBLE
+                        scaleX = 0.92f
+                        scaleY = 0.92f
+                        animate().scaleX(1f).scaleY(1f).setDuration(260L).start()
+                    }
                 }
                 speakGhostWord(chosen)
             }
@@ -2172,12 +2185,48 @@ class MainActivity : Activity(), SensorEventListener {
         }
     }
 
+    private fun hasPremiumAccess(): Boolean = true
+
+    private fun showPremiumRequired(feature: String) {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("PREMIUM 기능")
+            .setMessage("$feature은(는) PHANTOM SCOPE PREMIUM 전용 기능입니다. 설정 탭에서 프리미엄 상품을 확인해 주세요.")
+            .setNegativeButton("나중에", null)
+            .setPositiveButton("설정 열기") { _, _ -> showPage(2) }
+            .show()
+    }
+
+    // 유료 확장팩: 40개 대상 표현 × 25개 상황 문구 = 고유한 한국어 문구 1,000개.
+    // 무료 기본 100개는 기존 ghostWordsForLanguage("ko") 목록에 그대로 보존합니다.
+    private fun premiumGhostWordPack(): List<String> {
+        val subjects = listOf(
+            "그림자", "발자국", "검은 형체", "낯선 사람", "아이", "여자", "남자", "노인", "속삭임", "울음소리",
+            "웃음소리", "문", "창문", "복도", "계단", "지하실", "다락방", "옷장", "거울", "침대 밑",
+            "천장", "벽 뒤", "문틈", "창밖", "발소리", "손자국", "얼굴", "눈", "목소리", "숨소리",
+            "기척", "낡은 인형", "빈 방", "닫힌 문", "검은 손", "차가운 손", "흐릿한 형체", "낯선 목소리", "긴 머리", "하얀 옷"
+        )
+        val templates = listOf(
+            "%s가 보여", "%s가 있어", "%s가 움직여", "%s가 다가와", "%s가 기다려", "%s를 보지 마", "%s를 찾아", "%s를 따라가",
+            "%s 뒤에 있어", "%s 안에 있어", "%s 아래를 봐", "%s 위를 봐", "%s에서 소리가 나", "%s가 널 불러", "%s가 널 보고 있어",
+            "%s를 열지 마", "%s를 닫아", "%s를 기억해", "%s가 다시 왔어", "%s가 사라졌어", "%s가 가까워", "%s가 멀어졌어",
+            "%s에게 대답해", "%s를 조심해", "%s가 여기 있어"
+        )
+        val result = ArrayList<String>(1000)
+        for (template in templates) {
+            for (subject in subjects) {
+                result.add(template.format(subject))
+                if (result.size == 1000) return result.distinct().take(1000)
+            }
+        }
+        return result.distinct().take(1000)
+    }
+
     private fun showSettingsPage() {
-        addHeading("PHANTOM SETTINGS")
+        addHeading("어둠의 규칙")
 
         val languagePanel = makePanel()
         val languageTitle = TextView(this).apply {
-            text = "단어 출력 언어"
+            text = "언어"
             textSize = 16f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
@@ -2217,7 +2266,7 @@ class MainActivity : Activity(), SensorEventListener {
 
         val voicePanel = makePanel()
         val voiceSwitch = Switch(this).apply {
-            text = "유령 단어 음성 출력"
+            text = "목소리"
             textSize = 15f
             setTextColor(Color.WHITE)
             isChecked = ghostSpeechEnabled
@@ -2229,7 +2278,7 @@ class MainActivity : Activity(), SensorEventListener {
         }
         voicePanel.addView(voiceSwitch)
         val voiceHint = TextView(this).apply {
-            text = "자기장 감지 후 단어가 나타날 때 기기 음성으로 읽어줍니다. 음성은 기기에 설치된 TTS 엔진과 언어 데이터에 따라 달라집니다."
+            text = "그 목소리를 들을 것인가."
             textSize = 11f
             setTextColor(Color.LTGRAY)
             setPadding(0, dp(8), 0, 0)
@@ -2240,14 +2289,8 @@ class MainActivity : Activity(), SensorEventListener {
         })
 
         addPanelText(
-            "AD-FREE",
-            "광고 영구 제거\nGoogle Play 결제 및 직접 배포판 결제 연결 후 이용할 수 있습니다."
-        )
-        addStoreItem("광고 제거", "광고 없이 PHANTOM SCOPE를 이용합니다.", "★")
-        addStoreItem("개발자 후원", "앱의 지속적인 개발과 업데이트를 응원합니다.", "♡")
-        addPanelText(
-            "ABOUT",
-            "PHANTOM SCOPE\n자기장 센서 기반 엔터테인먼트 탐사 도구\n\n단어 출력은 무작위 연출이며 실제 유령이나 음성을 검출하지 않습니다."
+            "WARNING",
+            "문을 열기 전, 안쪽에서 들리는 소리에 귀 기울이지 마라."
         )
     }
 
