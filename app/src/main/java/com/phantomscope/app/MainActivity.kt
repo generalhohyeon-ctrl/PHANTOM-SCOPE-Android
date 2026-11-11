@@ -294,7 +294,12 @@ class MainActivity : Activity(), SensorEventListener {
         logPreferences = getSharedPreferences("phantom_scope_logs", MODE_PRIVATE)
         soundPreferences = getSharedPreferences("phantom_scope_sound_events", MODE_PRIVATE)
         settingsPreferences = getSharedPreferences("phantom_scope_settings", MODE_PRIVATE)
-        anomalyTriggerThreshold = settingsPreferences?.getFloat("emf_word_threshold_ut", 5f) ?: 5f
+        val savedSensitivity = settingsPreferences?.getInt("emf_sensitivity_percent", -1) ?: -1
+        anomalyTriggerThreshold = if (savedSensitivity >= 0) {
+            10f - (savedSensitivity / 99f) * 9.5f
+        } else {
+            settingsPreferences?.getFloat("emf_word_threshold_ut", 5f) ?: 5f
+        }
         ghostLogPreferences = getSharedPreferences("phantom_scope_word_logs", MODE_PRIVATE)
         loadGhostWordLogs()
         selectedLanguage = settingsPreferences?.getString("ghost_language", "ko") ?: "ko"
@@ -376,7 +381,7 @@ class MainActivity : Activity(), SensorEventListener {
 
         currentValue = magnitude
 
-        updateSpectrum(if (baselineCount >= 30) abs(magnitude - baseline) else 0f)
+        updateSpectrum(magnitude)
 
         readings.add(magnitude)
         if (readings.size > 60) {
@@ -422,9 +427,9 @@ class MainActivity : Activity(), SensorEventListener {
         while (spectrumSamples.size > 4) spectrumSamples.removeFirst()
         smoothedSpectrumValue = spectrumSamples.average().toFloat()
 
-        // Android 센서값(μT)을 mG로 환산합니다. 표시 범위는 1.5~20 mG입니다.
-        val milligauss = smoothedSpectrumValue * 10f
-        val normalized = ((milligauss - 1.5f) / (20f - 1.5f)).coerceIn(0f, 1f)
+        // 일상적인 지구 자기장 범위에서 시작해 절대 자기장 강도를 표시합니다.
+        // 25 μT부터 75 μT까지 LED가 녹색 → 노랑 → 주황 → 빨강으로 채워집니다.
+        val normalized = ((smoothedSpectrumValue - 25f) / (75f - 25f)).coerceIn(0f, 1f)
         val exactLevel = normalized * spectrumSegments.size
         lastSpectrumLevel = exactLevel.toInt().coerceIn(0, spectrumSegments.size)
         val partial = exactLevel - lastSpectrumLevel
@@ -474,7 +479,7 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun formatField(value: Float): String {
-        return String.format(Locale.US, "%.1f mG", value * 10f)
+        return String.format(Locale.US, "%.1f μT", value)
     }
 
     private fun showPage(index: Int) {
@@ -1952,7 +1957,7 @@ class MainActivity : Activity(), SensorEventListener {
         summary.addView(count)
 
         val info = TextView(this).apply {
-            text = "자기장 변화량이 ${String.format(Locale.US, "%.1f", anomalyTriggerThreshold * 10f)} mG 이상이면 자동 저장됩니다."
+            text = "감지 기록"
             textSize = 11f
             setTextColor(Color.LTGRAY)
             setPadding(0, dp(8), 0, 0)
@@ -1984,7 +1989,7 @@ class MainActivity : Activity(), SensorEventListener {
             addPanelText(
                 "NO SAVED INVESTIGATIONS",
                 "아직 자동 기록된 자기장 변화가 없습니다.\n\n" +
-                    "${String.format(Locale.US, "%.1f", anomalyTriggerThreshold * 10f)} mG 이상 변화하면 이곳에 기록됩니다."
+                    "기록 없음"
             )
             return
         }
@@ -2024,7 +2029,7 @@ class MainActivity : Activity(), SensorEventListener {
                     "수동 증거 자료가 연결된 조사 기록"
                 } else {
                     "FIELD  ${formatField(record.fieldValue)}\\n" +
-                        "DEVIATION  +${String.format(Locale.US, "%.1f", record.deviation * 10f)} mG"
+                        "DEVIATION  +${String.format(Locale.US, "%.1f", record.deviation)} μT"
                 }
                 textSize = 12f
                 setTextColor(Color.WHITE)
@@ -2196,7 +2201,7 @@ class MainActivity : Activity(), SensorEventListener {
                 textSize = 12f; setTextColor(Color.WHITE)
             }
             val right = TextView(this).apply {
-                text = "${(item.fieldValue * 10f).formatOne()} mG · ${item.level}"
+                text = "${item.fieldValue.formatOne()} μT · ${item.level}"
                 textSize = 10f; setTextColor(accentColor); gravity = Gravity.RIGHT
             }
             row.addView(left, LinearLayout.LayoutParams(0, -2, 1f))
@@ -2236,14 +2241,16 @@ class MainActivity : Activity(), SensorEventListener {
                     deviation >= 10f -> Color.rgb(255, 170, 75)
                     else -> accentColor
                 }
-                listOfNotNull(ghostWordText, cameraGhostWordText).forEach { wordView ->
+                listOfNotNull(ghostWordText?.takeIf { it.isAttachedToWindow }, cameraGhostWordText?.takeIf { it.isAttachedToWindow }).forEach { wordView ->
                     wordView.apply {
                         text = chosen
                         setTextColor(wordColor)
                         visibility = View.VISIBLE
-                        scaleX = 0.92f
-                        scaleY = 0.92f
-                        animate().scaleX(1f).scaleY(1f).setDuration(260L).start()
+                        // 녹화 중 Surface/Window 재구성으로 인한 충돌을 피하기 위해
+                        // 자막 갱신 시 View 애니메이션을 사용하지 않습니다.
+                        animate().cancel()
+                        scaleX = 1f
+                        scaleY = 1f
                     }
                 }
                 speakGhostWord(chosen)
@@ -2285,8 +2292,8 @@ class MainActivity : Activity(), SensorEventListener {
             try {
                 configureGhostVoiceLanguage()
                 ghostTts?.speak(word, TextToSpeech.QUEUE_FLUSH, null, "phantom-${System.currentTimeMillis()}")
-            } catch (e: Exception) {
-                android.util.Log.w("PhantomVoice", "TTS playback failed", e)
+            } catch (t: Throwable) {
+                android.util.Log.w("PhantomVoice", "TTS playback failed; recording continues", t)
             }
         }
     }
@@ -2409,40 +2416,50 @@ class MainActivity : Activity(), SensorEventListener {
         })
 
         val sensitivityPanel = makePanel()
+        val sensitivityHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
         val sensitivityTitle = TextView(this).apply {
-            text = "EMF 감지 민감도"
+            text = "민감도"
             textSize = 15f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
         }
-        sensitivityPanel.addView(sensitivityTitle)
-        val sensitivityValue = TextView(this).apply {
-            text = "단어 감지 기준  ${String.format(Locale.US, "%.1f", anomalyTriggerThreshold * 10f)} mG"
-            textSize = 12f
-            setTextColor(accentColor)
-            setPadding(0, dp(6), 0, 0)
+        val savedPercent = settingsPreferences?.getInt("emf_sensitivity_percent", -1) ?: -1
+        val initialPercent = if (savedPercent >= 0) savedPercent else {
+            (((10f - anomalyTriggerThreshold) / 9.5f) * 99f).roundToInt().coerceIn(0, 99)
         }
-        sensitivityPanel.addView(sensitivityValue)
+        val sensitivityValue = TextView(this).apply {
+            text = "${initialPercent + 1}%"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(accentColor)
+        }
+        sensitivityHeader.addView(sensitivityTitle, LinearLayout.LayoutParams(0, -2, 1f))
+        sensitivityHeader.addView(sensitivityValue)
+        sensitivityPanel.addView(sensitivityHeader)
         val sensitivitySeek = SeekBar(this).apply {
-            max = 95 // 0.5~10.0 μT = 5~100 mG
-            progress = ((anomalyTriggerThreshold - 0.5f) * 10f).roundToInt().coerceIn(0, max)
+            max = 99
+            progress = initialPercent
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                    anomalyTriggerThreshold = 0.5f + progress / 10f
-                    sensitivityValue.text = "단어 감지 기준  ${String.format(Locale.US, "%.1f", anomalyTriggerThreshold * 10f)} mG"
-                    if (fromUser) settingsPreferences?.edit()?.putFloat("emf_word_threshold_ut", anomalyTriggerThreshold)?.apply()
+                    val percent = progress + 1
+                    // 민감도 값이 높을수록 감지 임계값이 낮아집니다.
+                    anomalyTriggerThreshold = 10f - (progress / 99f) * 9.5f
+                    sensitivityValue.text = "${percent}%"
+                    if (fromUser) {
+                        settingsPreferences?.edit()
+                            ?.putInt("emf_sensitivity_percent", progress)
+                            ?.putFloat("emf_word_threshold_ut", anomalyTriggerThreshold)
+                            ?.apply()
+                    }
                 }
                 override fun onStartTrackingTouch(seekBar: SeekBar?) {}
                 override fun onStopTrackingTouch(seekBar: SeekBar?) {}
             })
         }
         sensitivityPanel.addView(sensitivitySeek)
-        val sensitivityHint = TextView(this).apply {
-            text = "왼쪽으로 조정할수록 작은 자기장 변화에도 반응합니다."
-            textSize = 11f
-            setTextColor(Color.LTGRAY)
-        }
-        sensitivityPanel.addView(sensitivityHint)
         content.addView(sensitivityPanel, LinearLayout.LayoutParams(-1, -2).apply {
             setMargins(0, 0, 0, dp(12))
         })
@@ -2506,10 +2523,10 @@ class MainActivity : Activity(), SensorEventListener {
             setPadding(0, dp(12), 0, 0)
         }
 
-        currentText = addStatRow(grid, "CURRENT", "-- mG")
-        averageText = addStatRow(grid, "AVERAGE", "-- mG")
-        maximumText = addStatRow(grid, "MAXIMUM", "-- mG")
-        minimumText = addStatRow(grid, "MINIMUM", "-- mG")
+        currentText = addStatRow(grid, "CURRENT", "-- μT")
+        averageText = addStatRow(grid, "AVERAGE", "-- μT")
+        maximumText = addStatRow(grid, "MAXIMUM", "-- μT")
+        minimumText = addStatRow(grid, "MINIMUM", "-- μT")
 
         panel.addView(grid)
         content.addView(panel)
