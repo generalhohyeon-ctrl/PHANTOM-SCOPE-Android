@@ -1,6 +1,20 @@
 package com.phantomscope.app
 
 import android.app.Activity
+import android.app.Service
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.util.DisplayMetrics
+import android.os.IBinder
+import android.os.ParcelFileDescriptor
 import android.Manifest
 import android.content.Context
 import android.content.ContentValues
@@ -80,6 +94,13 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var minimumText: TextView
 
     private val spectrumSegments = mutableListOf<View>()
+    private var spectrumBar: View? = null
+    private var ghostWordText: TextView? = null
+    private var settingsPreferences: SharedPreferences? = null
+    private var selectedLanguage = "ko"
+    private var lastGhostWordTime = 0L
+    private var ghostWordArmed = true
+    private val ghostWordCooldownMs = 6500L
     private val spectrumSamples = ArrayDeque<Float>()
     private var smoothedSpectrumValue = 0f
     private var lastSpectrumLevel = 0
@@ -119,6 +140,11 @@ class MainActivity : Activity(), SensorEventListener {
     private var cameraSurfaceHolder: SurfaceHolder? = null
     private var cameraNightOverlay: View? = null
     private var cameraStatusText: TextView? = null
+    private var cameraControlsView: LinearLayout? = null
+    private var cameraExitButton: Button? = null
+    private var screenRecording = false
+    private var screenCaptureRequestPending = false
+    private val screenCaptureRequestCode = 9012
     private var nightVisionEnabled = false
     private var useFrontCamera = false
     private var flashEnabled = false
@@ -170,7 +196,7 @@ class MainActivity : Activity(), SensorEventListener {
         }
 
         root.addView(subtitle)
-        val tabNames = listOf("레이더", "사운드", "카메라", "상점")
+        val tabNames = listOf("EMF", "카메라", "설정")
 
         val tabRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -195,8 +221,6 @@ class MainActivity : Activity(), SensorEventListener {
             }
         }
 
-        root.addView(tabRow)
-
         val scrollView = ScrollView(this).apply {
             isFillViewport = true
         }
@@ -210,6 +234,12 @@ class MainActivity : Activity(), SensorEventListener {
         root.addView(
             scrollView,
             LinearLayout.LayoutParams(-1, 0, 1f)
+        )
+
+        // 하단 고정 내비게이션
+        root.addView(
+            tabRow,
+            LinearLayout.LayoutParams(-1, -2)
         )
 
         mainRootView = root
@@ -229,6 +259,8 @@ class MainActivity : Activity(), SensorEventListener {
 
         logPreferences = getSharedPreferences("phantom_scope_logs", MODE_PRIVATE)
         soundPreferences = getSharedPreferences("phantom_scope_sound_events", MODE_PRIVATE)
+        settingsPreferences = getSharedPreferences("phantom_scope_settings", MODE_PRIVATE)
+        selectedLanguage = settingsPreferences?.getString("ghost_language", "ko") ?: "ko"
         loadInvestigationRecords()
         loadSoundEvents()
         loadSavedAudioFiles()
@@ -276,6 +308,7 @@ class MainActivity : Activity(), SensorEventListener {
             })
         }
         panel.addView(bar)
+        spectrumBar = bar
 
         sensorStatusText = TextView(this).apply {
             text = if (magneticSensor == null) "MAGNETIC SENSOR NOT SUPPORTED" else "SENSOR CALIBRATING"
@@ -312,9 +345,14 @@ class MainActivity : Activity(), SensorEventListener {
 
     override fun onPause() {
         stopAudioMonitoring()
-        cameraPageVisible = false
-        releaseCamera()
-        closePoseDetector()
+        if (screenRecording) stopScreenRecording()
+        // The system screen-capture consent dialog briefly pauses the Activity.
+        // Keep the camera alive until the permission result returns.
+        if (!screenCaptureRequestPending) {
+            cameraPageVisible = false
+            releaseCamera()
+            closePoseDetector()
+        }
         super.onPause()
         sensorManager.unregisterListener(this)
     }
@@ -365,6 +403,7 @@ class MainActivity : Activity(), SensorEventListener {
             }
 
             handleAnomaly(deviation, magnitude)
+            maybeShowGhostWord(deviation)
         }
     }
 
@@ -373,6 +412,16 @@ class MainActivity : Activity(), SensorEventListener {
         spectrumSamples.addLast(value)
         while (spectrumSamples.size > 12) spectrumSamples.removeFirst()
         smoothedSpectrumValue = spectrumSamples.average().toFloat()
+
+        // 완전히 고정된 계기판처럼 보이지 않도록 센서 변화에 비례한 아주 미세한 흔들림
+        val deviationForMotion = if (baselineCount >= 30) abs(value - baseline) else 0f
+        val motionStrength = (deviationForMotion / 18f).coerceIn(0f, 1f)
+        spectrumBar?.let { bar ->
+            val phase = System.currentTimeMillis() / 95.0
+            bar.translationX = (sin(phase) * 1.8f * motionStrength).toFloat()
+            bar.translationY = (cos(phase * 0.83) * 1.0f * motionStrength).toFloat()
+            bar.rotation = (sin(phase * 0.65) * 0.22f * motionStrength).toFloat()
+        }
 
         // 기존 기기의 일반적인 자기장 범위(약 25~120 μT)를 12단계 LED로 표시합니다.
         val normalized = ((smoothedSpectrumValue - 25f) / 95f).coerceIn(0f, 1f)
@@ -430,7 +479,7 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun showPage(index: Int) {
-        if (index != 2) {
+        if (index != 1) {
             cameraPageVisible = false
             releaseCamera()
             closePoseDetector()
@@ -452,12 +501,10 @@ class MainActivity : Activity(), SensorEventListener {
 
         when (index) {
             0 -> showRadarPage()
-            1 -> showAudioPage()
-            2 -> showCameraPage()
-            3 -> showStorePage()
+            1 -> showCameraPage()
+            2 -> showSettingsPage()
         }
     }
-
 
     private fun showCameraPage() {
         cameraPageVisible = true
@@ -540,8 +587,15 @@ class MainActivity : Activity(), SensorEventListener {
             isAllCaps = false
             setTextColor(Color.WHITE)
             setBackgroundColor(warningColor)
-            setOnClickListener { showPage(0) }
+            setOnClickListener {
+                if (screenRecording) {
+                    stopScreenRecording()
+                } else {
+                    showPage(0)
+                }
+            }
         }
+        cameraExitButton = exitButton
         topBar.addView(exitButton, LinearLayout.LayoutParams(dp(92), dp(44)))
         cameraRoot.addView(topBar, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
 
@@ -618,9 +672,19 @@ class MainActivity : Activity(), SensorEventListener {
             setBackgroundColor(Color.rgb(30, 125, 85))
             setOnClickListener { captureEvidencePhoto() }
         }
-        secondRow.addView(flashButton, LinearLayout.LayoutParams(0, dp(48), 1f))
-        secondRow.addView(captureButton, LinearLayout.LayoutParams(0, dp(48), 1f))
+        val recordButton = Button(this).apply {
+            text = "동영상 녹화"
+            textSize = 10f
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.rgb(155, 45, 45))
+            setOnClickListener { requestScreenRecording() }
+        }
+        secondRow.addView(flashButton, LinearLayout.LayoutParams(0, dp(48), 0.8f))
+        secondRow.addView(captureButton, LinearLayout.LayoutParams(0, dp(48), 1.1f))
+        secondRow.addView(recordButton, LinearLayout.LayoutParams(0, dp(48), 1f))
         controls.addView(secondRow)
+        cameraControlsView = controls
         cameraRoot.addView(controls, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
 
         setContentView(cameraRoot)
@@ -648,6 +712,63 @@ class MainActivity : Activity(), SensorEventListener {
             setTextColor(warningColor)
         }
         releaseCamera()
+    }
+
+    private fun requestScreenRecording() {
+        if (screenRecording) return
+        try {
+            val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            screenCaptureRequestPending = true
+            startActivityForResult(manager.createScreenCaptureIntent(), screenCaptureRequestCode)
+        } catch (e: Exception) {
+            Toast.makeText(this, "화면 녹화 준비 실패: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    @Deprecated("Deprecated in Android API, retained for compatibility")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == screenCaptureRequestCode) {
+            screenCaptureRequestPending = false
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                val start = Intent(this, PhantomScreenRecordingService::class.java).apply {
+                    action = PhantomScreenRecordingService.ACTION_START
+                    putExtra(PhantomScreenRecordingService.EXTRA_RESULT_CODE, resultCode)
+                    putExtra(PhantomScreenRecordingService.EXTRA_RESULT_DATA, data)
+                }
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    startForegroundService(start)
+                } else {
+                    startService(start)
+                }
+                screenRecording = true
+                cameraControlsView?.visibility = View.GONE
+                cameraExitButton?.text = "녹화 종료"
+                cameraStatusText?.apply {
+                    text = "● REC  |  모션캡쳐 포함 녹화 중"
+                    setTextColor(Color.RED)
+                }
+                Toast.makeText(this, "화면 녹화를 시작했습니다. 모션캡쳐 화면이 영상에 포함됩니다.", Toast.LENGTH_LONG).show()
+            } else {
+                Toast.makeText(this, "동영상 녹화 권한이 취소되었습니다.", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun stopScreenRecording() {
+        if (!screenRecording) return
+        val stop = Intent(this, PhantomScreenRecordingService::class.java).apply {
+            action = PhantomScreenRecordingService.ACTION_STOP
+        }
+        startService(stop)
+        screenRecording = false
+        cameraControlsView?.visibility = View.VISIBLE
+        cameraExitButton?.text = "나가기 ✕"
+        cameraStatusText?.apply {
+            text = "동영상 저장 중..."
+            setTextColor(accentColor)
+        }
+        Toast.makeText(this, "녹화를 종료했습니다. 동영상 저장을 마무리합니다.", Toast.LENGTH_LONG).show()
     }
 
     override fun onRequestPermissionsResult(
@@ -866,11 +987,12 @@ class MainActivity : Activity(), SensorEventListener {
             return
         }
         try {
+            val poseSnapshot = capturePoseOverlaySnapshot()
             active.takePicture(null, null) { bytes, sourceCamera ->
                 try {
                     val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                     val displayName = "PHANTOM_$stamp.jpg"
-                    val photoWithOverlay = composePoseOverlayIntoPhoto(bytes)
+                    val photoWithOverlay = composePoseOverlayIntoPhoto(bytes, poseSnapshot)
                     val savedLocation = savePhotoToGallery(photoWithOverlay, displayName)
                     attachEvidenceToLatestRecord(savedLocation.first)
 
@@ -914,33 +1036,53 @@ class MainActivity : Activity(), SensorEventListener {
      * Older Android versions use the app-specific Pictures folder.
      * Returns the persisted location and a short location label.
      */
-    private fun composePoseOverlayIntoPhoto(jpegBytes: ByteArray): ByteArray {
-        val overlayView = poseOverlay ?: return jpegBytes
-        if (!poseDetectionEnabled || overlayView.width <= 0 || overlayView.height <= 0) return jpegBytes
-        val poseBitmap = try {
+    private fun capturePoseOverlaySnapshot(): Bitmap? {
+        val overlayView = poseOverlay ?: return null
+        if (!poseDetectionEnabled || overlayView.width <= 0 || overlayView.height <= 0) return null
+        return try {
             Bitmap.createBitmap(overlayView.width, overlayView.height, Bitmap.Config.ARGB_8888).also { bitmap ->
                 val canvas = Canvas(bitmap)
                 overlayView.draw(canvas)
             }
-        } catch (_: Exception) { return jpegBytes }
+        } catch (_: Exception) { null }
+    }
 
-        val photoBitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+    private fun composePoseOverlayIntoPhoto(jpegBytes: ByteArray, poseBitmap: Bitmap?): ByteArray {
+        if (poseBitmap == null || poseBitmap.isRecycled) return jpegBytes
+        val decoded = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
             ?: return jpegBytes
         return try {
-            val scaledOverlay = Bitmap.createScaledBitmap(
-                poseBitmap, photoBitmap.width, photoBitmap.height, true
-            )
+            // Camera JPEG bytes are commonly landscape even when the live preview is portrait.
+            // Rotate the pixels before compositing so the pose overlay uses the same orientation.
+            val rotation = ((poseRotationDegrees % 360) + 360) % 360
+            val rotateMatrix = Matrix().apply {
+                if (rotation != 0) postRotate(rotation.toFloat())
+                if (useFrontCamera) postScale(-1f, 1f)
+            }
+            val photoBitmap = if (rotation != 0 || useFrontCamera) {
+                Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, rotateMatrix, true).also {
+                    if (it !== decoded) decoded.recycle()
+                }
+            } else decoded
+
             val canvas = Canvas(photoBitmap)
+            val srcW = poseBitmap.width.toFloat()
+            val srcH = poseBitmap.height.toFloat()
+            val scale = max(photoBitmap.width / srcW, photoBitmap.height / srcH)
+            val scaledW = srcW * scale
+            val scaledH = srcH * scale
+            val left = (photoBitmap.width - scaledW) / 2f
+            val top = (photoBitmap.height - scaledH) / 2f
+            val dst = RectF(left, top, left + scaledW, top + scaledH)
             val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-            canvas.drawBitmap(scaledOverlay, 0f, 0f, paint)
+            canvas.drawBitmap(poseBitmap, null, dst, paint)
             val output = java.io.ByteArrayOutputStream()
             photoBitmap.compress(Bitmap.CompressFormat.JPEG, 94, output)
-            if (scaledOverlay !== poseBitmap) scaledOverlay.recycle()
             poseBitmap.recycle()
             photoBitmap.recycle()
             output.toByteArray()
         } catch (_: Exception) {
-            try { poseBitmap.recycle(); photoBitmap.recycle() } catch (_: Exception) { }
+            try { poseBitmap.recycle(); decoded.recycle() } catch (_: Exception) { }
             jpegBytes
         }
     }
@@ -1773,7 +1915,7 @@ class MainActivity : Activity(), SensorEventListener {
                 investigationRecords.clear()
                 anomalyActive = false
                 saveInvestigationRecords()
-                showPage(3)
+                showPage(2)
             }
         }
         summary.addView(clear, LinearLayout.LayoutParams(-1, dp(42)).apply {
@@ -1859,7 +2001,7 @@ class MainActivity : Activity(), SensorEventListener {
                     if (actualIndex in investigationRecords.indices) {
                         investigationRecords.removeAt(actualIndex)
                         saveInvestigationRecords()
-                        showPage(3)
+                        showPage(2)
                     }
                 }
             }
@@ -1871,56 +2013,153 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun showRadarPage() {
-        addHeading("EMF RADAR")
+        addHeading("EMF PANORAMA")
 
         val spectrumPanel = createSpectrum()
         content.addView(spectrumPanel, LinearLayout.LayoutParams(-1, -2).apply {
-            setMargins(0, dp(2), 0, dp(12))
+            setMargins(0, dp(2), 0, dp(14))
         })
 
-        radarView = RadarView(this)
-        content.addView(radarView, LinearLayout.LayoutParams(-1, dp(300)).apply {
+        val wordPanel = makePanel().apply {
+            gravity = Gravity.CENTER
+            setPadding(dp(18), dp(24), dp(18), dp(24))
+        }
+        val wordCaption = TextView(this).apply {
+            text = "PARANORMAL WORD RESPONSE"
+            textSize = 10f
+            letterSpacing = 1.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.GRAY)
+            gravity = Gravity.CENTER
+        }
+        wordPanel.addView(wordCaption)
+
+        ghostWordText = TextView(this).apply {
+            text = "주변을 탐색하고 있습니다..."
+            textSize = 29f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(accentColor)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(18), 0, dp(8))
+        }
+        wordPanel.addView(ghostWordText)
+
+        val hint = TextView(this).apply {
+            text = "자기장 변화가 감지되면 확률적으로 단어가 나타납니다."
+            textSize = 10f
+            setTextColor(Color.LTGRAY)
+            gravity = Gravity.CENTER
+        }
+        wordPanel.addView(hint)
+        content.addView(wordPanel, LinearLayout.LayoutParams(-1, -2).apply {
             setMargins(0, 0, 0, dp(12))
         })
 
-        radarView.setCalibration(baselineCount.toFloat() / 30f)
-        if (baselineCount >= 30) {
-            val deviation = abs(currentValue - baseline)
-            radarView.updateData(deviation, 0f, 0f)
-        }
-
         addPanelText(
-            "COLOR EMF METER",
-            "자기장 센서의 측정 강도를 색상으로 표시합니다. 숫자는 표시하지 않으며, 최근 측정값을 부드럽게 평균 내어 색상 변화가 급격하게 흔들리지 않도록 했습니다.\\n\\n" +
-                "초록은 낮은 강도, 노랑은 중간 강도, 주황과 빨강은 높은 강도, 보라색은 매우 높은 강도를 나타냅니다.\\n\\n" +
-                "이 기능은 휴대폰 자기장 센서의 변화 표시이며, 초자연 현상이나 유령의 존재를 판별하는 장치는 아닙니다."
+            "EMF FIELD",
+            "가로형 색상 파노라마가 자기장 센서의 변화를 보여줍니다. 기기의 방향이나 주변 전자기기 등에 따라서도 값이 달라질 수 있습니다.\n\n" +
+                "단어 출력은 센서 변화에 반응하는 무작위 연출이며 실제 음성이나 초자연 현상을 검출하는 기능은 아닙니다."
         )
     }
 
-    private fun showStorePage() {
-        addHeading("PHANTOM STORE")
+    private fun maybeShowGhostWord(deviation: Float) {
+        val now = System.currentTimeMillis()
+        if (deviation < anomalyTriggerThreshold) {
+            if (deviation < anomalyResetThreshold) ghostWordArmed = true
+            return
+        }
+        if (!ghostWordArmed || now - lastGhostWordTime < ghostWordCooldownMs) return
+
+        // 변화가 커질수록 출력 확률을 조금 높이되, 매번 출력하지는 않습니다.
+        val probability = (0.22f + ((deviation - anomalyTriggerThreshold) / 30f))
+            .coerceIn(0.22f, 0.58f)
+        // 한 번의 감지 구간에서는 확률 판정을 한 번만 수행합니다.
+        lastGhostWordTime = now
+        ghostWordArmed = false
+        if (Math.random().toFloat() < probability) {
+            val words = ghostWordsForLanguage(selectedLanguage)
+            val previous = ghostWordText?.text?.toString()
+            val candidates = words.filter { it != previous }
+            val chosen = (candidates.ifEmpty { words }).random()
+            runOnUiThread {
+                ghostWordText?.apply {
+                    text = chosen
+                    setTextColor(
+                        when {
+                            deviation >= 18f -> Color.rgb(255, 90, 110)
+                            deviation >= 10f -> Color.rgb(255, 170, 75)
+                            else -> accentColor
+                        }
+                    )
+                    scaleX = 0.92f
+                    scaleY = 0.92f
+                    animate().scaleX(1f).scaleY(1f).setDuration(260L).start()
+                }
+            }
+        }
+    }
+
+    private fun ghostWordsForLanguage(language: String): List<String> {
+        return when (language) {
+            "en" -> listOf("HELP", "LEAVE", "BEHIND", "WHO", "RUN", "DANGER", "HERE", "WHY", "COLD", "STOP", "COME", "NO")
+            "ja" -> listOf("たすけて", "にげて", "うしろ", "だれ", "あぶない", "ここ", "なぜ", "さむい", "やめて", "きて", "いいえ")
+            "zh" -> listOf("救命", "离开", "身后", "谁", "危险", "这里", "为什么", "冷", "停止", "过来", "不")
+            "es" -> listOf("AYUDA", "VETE", "DETRÁS", "QUIÉN", "PELIGRO", "AQUÍ", "POR QUÉ", "FRÍO", "PARA", "VEN", "NO")
+            else -> listOf("도와줘", "가지 마", "뒤에", "누구야", "위험해", "여기야", "왜", "추워", "그만해", "이리 와", "아니", "살려줘")
+        }
+    }
+
+    private fun showSettingsPage() {
+        addHeading("PHANTOM SETTINGS")
+
+        val languagePanel = makePanel()
+        val languageTitle = TextView(this).apply {
+            text = "단어 출력 언어"
+            textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        }
+        languagePanel.addView(languageTitle)
+
+        val languageOptions = listOf("한국어", "English", "日本語", "中文", "Español")
+        val languageCodes = listOf("ko", "en", "ja", "zh", "es")
+        val spinner = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                languageOptions
+            )
+            setSelection(languageCodes.indexOf(selectedLanguage).coerceAtLeast(0))
+            onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+                override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+                override fun onItemSelected(
+                    parent: android.widget.AdapterView<*>?,
+                    view: View?,
+                    position: Int,
+                    id: Long
+                ) {
+                    selectedLanguage = languageCodes[position]
+                    settingsPreferences?.edit()?.putString("ghost_language", selectedLanguage)?.apply()
+                    ghostWordText?.text = "탐사 대기 중..."
+                }
+            }
+        }
+        languagePanel.addView(spinner, LinearLayout.LayoutParams(-1, dp(48)).apply {
+            setMargins(0, dp(12), 0, 0)
+        })
+        content.addView(languagePanel, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(0, 0, 0, dp(12))
+        })
+
         addPanelText(
-            "SUPPORT THE PROJECT",
-            "PHANTOM SCOPE의 개발과 업데이트를 응원해 주세요.\\n\\n후원 기능은 추후 결제 시스템 연결 후 제공됩니다."
+            "AD-FREE",
+            "광고 영구 제거\nGoogle Play 결제 및 직접 배포판 결제 연결 후 이용할 수 있습니다."
         )
-        addStoreItem(
-            "개발자 후원",
-            "앱의 지속적인 개발을 응원합니다.",
-            "♡"
-        )
-        addStoreItem(
-            "광고 제거",
-            "광고 없이 쾌적하게 이용할 수 있는 옵션입니다.",
-            "★"
-        )
-        addStoreItem(
-            "프리미엄 기능",
-            "추가 테마와 고급 기능을 준비하고 있습니다.",
-            "✦"
-        )
+        addStoreItem("광고 제거", "광고 없이 PHANTOM SCOPE를 이용합니다.", "★")
+        addStoreItem("개발자 후원", "앱의 지속적인 개발과 업데이트를 응원합니다.", "♡")
         addPanelText(
-            "COMING SOON",
-            "현재 상점은 메뉴 미리보기입니다. 후원 및 광고 제거 결제는 아직 연결되어 있지 않습니다."
+            "ABOUT",
+            "PHANTOM SCOPE\n자기장 센서 기반 엔터테인먼트 탐사 도구\n\n단어 출력은 무작위 연출이며 실제 유령이나 음성을 검출하지 않습니다."
         )
     }
 
@@ -2608,4 +2847,220 @@ class PoseOverlayView(context: Context) : View(context) {
         canvas.restoreToCount(save)
     }
     private fun dp(v: Float) = v * resources.displayMetrics.density
+}
+
+
+/**
+ * Records the visible camera screen through MediaProjection. Because the pose overlay is
+ * part of the same screen composition as the preview, the saved MP4 includes the skeleton.
+ */
+class PhantomScreenRecordingService : Service() {
+    companion object {
+        const val ACTION_START = "com.phantomscope.app.action.START_SCREEN_RECORDING"
+        const val ACTION_STOP = "com.phantomscope.app.action.STOP_SCREEN_RECORDING"
+        const val EXTRA_RESULT_CODE = "projection_result_code"
+        const val EXTRA_RESULT_DATA = "projection_result_data"
+        private const val CHANNEL_ID = "phantom_recording"
+        private const val NOTIFICATION_ID = 1901
+    }
+
+    private var projection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var recorder: MediaRecorder? = null
+    private var outputUri: Uri? = null
+    private var outputFile: File? = null
+    private var outputDescriptor: ParcelFileDescriptor? = null
+    private var recordingStarted = false
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_STOP -> {
+                finishRecording()
+                return START_NOT_STICKY
+            }
+            ACTION_START -> {
+                try {
+                    createNotificationChannel()
+                    val notification = buildNotification()
+                    if (android.os.Build.VERSION.SDK_INT >= 29) {
+                        startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                    } else {
+                        startForeground(NOTIFICATION_ID, notification)
+                    }
+                    val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+                    val resultData = if (android.os.Build.VERSION.SDK_INT >= 33) {
+                        intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(EXTRA_RESULT_DATA) as? Intent
+                    } ?: throw IllegalStateException("화면 녹화 권한 데이터가 없습니다.")
+                    startRecording(resultCode, resultData)
+                } catch (e: Exception) {
+                    android.util.Log.e("PhantomRecorder", "Recording start failed", e)
+                    finishRecording()
+                }
+            }
+        }
+        return START_NOT_STICKY
+    }
+
+    private fun createNotificationChannel() {
+        if (android.os.Build.VERSION.SDK_INT >= 26) {
+            val channel = NotificationChannel(CHANNEL_ID, "PHANTOM SCOPE 녹화", NotificationManager.IMPORTANCE_LOW)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        }
+    }
+
+    private fun buildNotification(): Notification {
+        val stopIntent = Intent(this, PhantomScreenRecordingService::class.java).apply { action = ACTION_STOP }
+        val pending = PendingIntent.getService(
+            this, 1902, stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val builder = if (android.os.Build.VERSION.SDK_INT >= 26) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+        return builder
+            .setContentTitle("PHANTOM SCOPE 녹화 중")
+            .setContentText("모션캡쳐 오버레이를 포함해 화면을 녹화하고 있습니다.")
+            .setSmallIcon(android.R.drawable.presence_video_online)
+            .setOngoing(true)
+            .addAction(Notification.Action.Builder(android.R.drawable.ic_media_pause, "녹화 종료", pending).build())
+            .build()
+    }
+
+    private fun startRecording(resultCode: Int, resultData: Intent) {
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        (getSystemService(WINDOW_SERVICE) as android.view.WindowManager).defaultDisplay.getRealMetrics(metrics)
+        val scale = min(1f, 1920f / max(metrics.widthPixels, metrics.heightPixels).toFloat())
+        val width = max(2, ((metrics.widthPixels * scale).toInt() / 2) * 2)
+        val height = max(2, ((metrics.heightPixels * scale).toInt() / 2) * 2)
+        val density = metrics.densityDpi
+
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val displayName = "PHANTOM_VIDEO_$stamp.mp4"
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/PHANTOM SCOPE")
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+            }
+            outputUri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                ?: throw java.io.IOException("동영상 저장 위치를 만들 수 없습니다.")
+            val descriptor = contentResolver.openFileDescriptor(outputUri!!, "w")
+                ?: throw java.io.IOException("동영상 파일을 열 수 없습니다.")
+            outputDescriptor = descriptor
+            recorder = if (android.os.Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else {
+                @Suppress("DEPRECATION")
+                MediaRecorder()
+            }
+            recorder!!.apply {
+                setVideoSource(MediaRecorder.VideoSource.SURFACE)
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                setVideoSize(width, height)
+                setVideoFrameRate(30)
+                setVideoEncodingBitRate(6_000_000)
+                setOutputFile(descriptor.fileDescriptor)
+                prepare()
+            }
+            val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            projection = manager.getMediaProjection(resultCode, resultData)
+            projection!!.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() { finishRecording() }
+            }, android.os.Handler(mainLooper))
+            val surface = recorder!!.surface
+            virtualDisplay = projection!!.createVirtualDisplay(
+                "PHANTOM_SCOPE_CAPTURE", width, height, density,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                surface, null, null
+            )
+            recorder!!.start()
+            recordingStarted = true
+        } else {
+            val folder = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "PhantomScope")
+            if (!folder.exists()) folder.mkdirs()
+            outputFile = File(folder, displayName)
+            recorder = if (android.os.Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else {
+                @Suppress("DEPRECATION")
+                MediaRecorder()
+            }
+            recorder!!.apply {
+                setVideoSource(MediaRecorder.VideoSource.SURFACE)
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                setVideoSize(width, height)
+                setVideoFrameRate(30)
+                setVideoEncodingBitRate(6_000_000)
+                setOutputFile(outputFile!!.absolutePath)
+                prepare()
+            }
+            val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            projection = manager.getMediaProjection(resultCode, resultData)
+            projection!!.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() { finishRecording() }
+            }, android.os.Handler(mainLooper))
+            virtualDisplay = projection!!.createVirtualDisplay(
+                "PHANTOM_SCOPE_CAPTURE", width, height, density,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                recorder!!.surface, null, null
+            )
+            recorder!!.start()
+            recordingStarted = true
+        }
+    }
+
+    private fun finishRecording() {
+        try {
+            virtualDisplay?.release()
+            virtualDisplay = null
+            if (recordingStarted) {
+                try { recorder?.stop() } catch (_: RuntimeException) { }
+            }
+            recordingStarted = false
+            try { recorder?.reset() } catch (_: Exception) { }
+            try { recorder?.release() } catch (_: Exception) { }
+            recorder = null
+            try { outputDescriptor?.close() } catch (_: Exception) { }
+            outputDescriptor = null
+            try { projection?.stop() } catch (_: Exception) { }
+            projection = null
+
+            outputUri?.let { uri ->
+                val values = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+                contentResolver.update(uri, values, null, null)
+                outputUri = null
+            }
+            outputFile?.let {
+                if (it.exists()) {
+                    val values = ContentValues().apply {
+                        put(MediaStore.Video.Media.DISPLAY_NAME, it.name)
+                        put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                        put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/PHANTOM SCOPE")
+                    }
+                    contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)?.let { uri ->
+                        contentResolver.openOutputStream(uri)?.use { out -> it.inputStream().use { input -> input.copyTo(out) } }
+                    }
+                }
+                outputFile = null
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("PhantomRecorder", "Recording finish failed", e)
+        } finally {
+            stopForeground(true)
+            stopSelf()
+        }
+    }
+
+    override fun onDestroy() {
+        if (recordingStarted || projection != null) finishRecording()
+        super.onDestroy()
+    }
 }
