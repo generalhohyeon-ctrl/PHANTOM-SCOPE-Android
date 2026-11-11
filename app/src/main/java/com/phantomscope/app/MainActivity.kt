@@ -62,6 +62,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.*
 
+data class GhostWordLog(val timestamp: Long, val word: String, val fieldValue: Float, val deviation: Float, val level: String)
+
 data class InvestigationRecord(
     val timestamp: Long,
     val fieldValue: Float,
@@ -72,9 +74,9 @@ data class InvestigationRecord(
 
 class MainActivity : Activity(), SensorEventListener {
 
-    private val backgroundColor = Color.rgb(8, 10, 15)
-    private val panelColor = Color.rgb(9, 19, 14)
-    private val accentColor = Color.rgb(80, 255, 105)
+    private val backgroundColor = Color.rgb(2, 5, 4)
+    private val panelColor = Color.rgb(5, 13, 9)
+    private val accentColor = Color.rgb(75, 255, 95)
     private val warningColor = Color.rgb(230, 55, 65)
 
     private lateinit var content: LinearLayout
@@ -109,6 +111,11 @@ class MainActivity : Activity(), SensorEventListener {
     private val spectrumSamples = ArrayDeque<Float>()
     private var smoothedSpectrumValue = 0f
     private var lastSpectrumLevel = 0
+    private var detectionRunning = false
+    private var detectionButton: Button? = null
+    private var ghostLogPreferences: SharedPreferences? = null
+    private val ghostWordLogs = mutableListOf<GhostWordLog>()
+    private var ghostLogContainer: LinearLayout? = null
     private val readings = mutableListOf<Float>()
     private lateinit var logPreferences: SharedPreferences
     private val investigationRecords = mutableListOf<InvestigationRecord>()
@@ -180,51 +187,68 @@ class MainActivity : Activity(), SensorEventListener {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(backgroundColor)
-            setPadding(dp(18), dp(18), dp(18), dp(10))
+            setPadding(dp(12), dp(8), dp(12), dp(6))
         }
 
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(0, dp(7), 0, dp(12))
+        }
         val title = TextView(this).apply {
             text = "PHANTOM SCOPE"
-            textSize = 25f
+            textSize = 27f
             setTextColor(accentColor)
             typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD_ITALIC)
-            setShadowLayer(dp(10).toFloat(), 0f, 0f, Color.rgb(25, 255, 75))
-            letterSpacing = 0.08f
+            setShadowLayer(dp(12).toFloat(), 0f, 0f, Color.rgb(20, 255, 70))
+            letterSpacing = 0.07f
             gravity = Gravity.CENTER
         }
-
-        root.addView(title, LinearLayout.LayoutParams(-1, dp(48)))
-
-        val subtitle = TextView(this).apply {
-            text = "HORROR INVESTIGATION SYSTEM"
-            textSize = 10f
-            letterSpacing = 2f
-            setTextColor(accentColor)
+        val brandLine = TextView(this).apply {
+            text = "━━━━━━━━━━━━  ◉  ━━━━━━━━━━━━"
+            textSize = 9f
+            setTextColor(Color.rgb(40, 150, 75))
+            gravity = Gravity.CENTER
+            setPadding(0, dp(1), 0, dp(2))
+        }
+        val versionLabel = TextView(this).apply {
+            text = "PARANORMAL DETECTION SYSTEM"
+            textSize = 9f
+            letterSpacing = 1.8f
+            setTextColor(Color.rgb(100, 220, 130))
             gravity = Gravity.CENTER
         }
+        header.addView(title, LinearLayout.LayoutParams(-1, dp(42)))
+        header.addView(brandLine, LinearLayout.LayoutParams(-1, dp(12)))
+        header.addView(versionLabel, LinearLayout.LayoutParams(-1, dp(18)))
+        root.addView(header, LinearLayout.LayoutParams(-1, -2))
 
-        root.addView(subtitle)
-        val tabNames = listOf("EMF", "카메라", "설정")
+        val tabNames = listOf("⌁\n탐지", "▣\n카메라", "⚙\n설정")
 
         val tabRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(0, dp(14), 0, dp(12))
+            setPadding(dp(4), dp(7), dp(4), dp(5))
+            background = roundedBackground(Color.rgb(3, 9, 6), 18)
         }
 
         tabButtons = tabNames.mapIndexed { index, name ->
             Button(this).apply {
                 text = name
-                textSize = 11f
+                textSize = 12f
                 isAllCaps = false
-                setTextColor(accentColor)
-                background = roundedBackground(panelColor, 12)
+                gravity = Gravity.CENTER
+                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                setLineSpacing(dp(1).toFloat(), 0.9f)
+                setTextColor(Color.LTGRAY)
+                background = roundedBackground(Color.rgb(3, 10, 6), 14)
+                elevation = dp(2).toFloat()
                 setOnClickListener { showPage(index) }
 
                 tabRow.addView(
                     this,
                     LinearLayout.LayoutParams(0, dp(44), 1f).apply {
-                        setMargins(dp(3), 0, dp(3), 0)
+                        setMargins(dp(4), dp(3), dp(4), dp(3))
                     }
                 )
             }
@@ -236,6 +260,7 @@ class MainActivity : Activity(), SensorEventListener {
 
         content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            setPadding(dp(2), dp(5), dp(2), dp(8))
         }
 
         scrollView.addView(content)
@@ -248,7 +273,7 @@ class MainActivity : Activity(), SensorEventListener {
         // 하단 고정 내비게이션
         root.addView(
             tabRow,
-            LinearLayout.LayoutParams(-1, -2)
+            LinearLayout.LayoutParams(-1, dp(66))
         )
 
         mainRootView = root
@@ -269,6 +294,8 @@ class MainActivity : Activity(), SensorEventListener {
         logPreferences = getSharedPreferences("phantom_scope_logs", MODE_PRIVATE)
         soundPreferences = getSharedPreferences("phantom_scope_sound_events", MODE_PRIVATE)
         settingsPreferences = getSharedPreferences("phantom_scope_settings", MODE_PRIVATE)
+        ghostLogPreferences = getSharedPreferences("phantom_scope_word_logs", MODE_PRIVATE)
+        loadGhostWordLogs()
         selectedLanguage = settingsPreferences?.getString("ghost_language", "ko") ?: "ko"
         ghostSpeechEnabled = settingsPreferences?.getBoolean("ghost_speech_enabled", true) ?: true
         initializeGhostVoice()
@@ -304,7 +331,7 @@ class MainActivity : Activity(), SensorEventListener {
         spectrumSegments.clear()
         // 300개의 고밀도 LED 셀로 작은 자기장 변화도 세밀하게 표현합니다.
         for (index in 0 until 300) {
-            val hue = 120f - (index / 299f) * 270f // green -> yellow -> red -> violet
+            val hue = 120f - (index / 299f) * 120f // green -> yellow -> orange -> red
             val color = Color.HSVToColor(floatArrayOf(hue.coerceAtLeast(0f), 0.9f, 1f))
             val segment = View(this).apply {
                 background = roundedBackground(color, 5)
@@ -411,8 +438,10 @@ class MainActivity : Activity(), SensorEventListener {
                 radarView.updateData(deviation, x, y)
             }
 
-            handleAnomaly(deviation, magnitude)
-            maybeShowGhostWord(deviation)
+            if (detectionRunning) {
+                handleAnomaly(deviation, magnitude)
+                maybeShowGhostWord(deviation)
+            }
         }
     }
 
@@ -422,8 +451,8 @@ class MainActivity : Activity(), SensorEventListener {
         while (spectrumSamples.size > 4) spectrumSamples.removeFirst()
         smoothedSpectrumValue = spectrumSamples.average().toFloat()
 
-        // 20~100 μT 범위를 300단계로 세분화하여 약 0.27 μT 단위의 변화를 표현합니다.
-        val normalized = ((smoothedSpectrumValue - 20f) / 80f).coerceIn(0f, 1f)
+        // 10~100 μT 범위를 300단계로 세분화하여 약 0.3 μT 단위의 변화를 표현합니다.
+        val normalized = ((smoothedSpectrumValue - 10f) / 90f).coerceIn(0f, 1f)
         val exactLevel = normalized * spectrumSegments.size
         lastSpectrumLevel = exactLevel.toInt().coerceIn(0, spectrumSegments.size)
         val partial = exactLevel - lastSpectrumLevel
@@ -451,7 +480,7 @@ class MainActivity : Activity(), SensorEventListener {
                     normalized < 0.25f -> Color.rgb(70, 220, 130)
                     normalized < 0.50f -> Color.rgb(220, 220, 65)
                     normalized < 0.75f -> Color.rgb(255, 145, 45)
-                    else -> Color.rgb(220, 65, 170)
+                    else -> Color.rgb(255, 45, 35)
                 }
             )
         }
@@ -493,8 +522,12 @@ class MainActivity : Activity(), SensorEventListener {
 
         if (!cameraFullscreen) {
             tabButtons.forEachIndexed { i, button ->
-                button.background = roundedBackground(if (i == index) Color.rgb(20, 75, 35) else panelColor, 12)
-                button.setTextColor(if (i == index) accentColor else Color.LTGRAY)
+                button.background = roundedBackground(
+                    if (i == index) Color.rgb(8, 35, 16) else Color.rgb(3, 10, 6), 14
+                )
+                button.setTextColor(if (i == index) accentColor else Color.rgb(175, 185, 178))
+                button.setShadowLayer(if (i == index) dp(8).toFloat() else 0f, 0f, 0f,
+                    Color.rgb(30, 255, 75))
             }
         }
 
@@ -582,7 +615,9 @@ class MainActivity : Activity(), SensorEventListener {
         cameraGhostWordText = cameraWordOverlay
         previewFrame.addView(
             cameraWordOverlay,
-            FrameLayout.LayoutParams(-1, -2, Gravity.CENTER)
+            FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply {
+                setMargins(dp(12), 0, dp(12), dp(26))
+            }
         )
         cameraRoot.addView(previewFrame, FrameLayout.LayoutParams(-1, -1))
 
@@ -2034,53 +2069,146 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun showRadarPage() {
-        addHeading("EMF DETECTOR")
-
+        addHeading("EMF")
         val spectrumPanel = createSpectrum()
         content.addView(spectrumPanel, LinearLayout.LayoutParams(-1, -2).apply {
-            setMargins(0, dp(2), 0, dp(14))
+            setMargins(0, dp(2), 0, dp(12))
         })
 
         val wordPanel = makePanel().apply {
             gravity = Gravity.CENTER
-            setPadding(dp(18), dp(24), dp(18), dp(24))
+            setPadding(dp(16), dp(18), dp(16), dp(18))
         }
         val wordCaption = TextView(this).apply {
-            text = "감지 단어"
+            text = "DETECTED WORD"
             textSize = 10f
-            letterSpacing = 1.5f
+            letterSpacing = 1.4f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.GRAY)
             gravity = Gravity.CENTER
         }
         wordPanel.addView(wordCaption)
-
         ghostWordText = TextView(this).apply {
-            text = "대기 중"
-            textSize = 29f
+            text = "—"
+            textSize = 30f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(accentColor)
             gravity = Gravity.CENTER
-            setPadding(0, dp(18), 0, dp(8))
+            setPadding(0, dp(12), 0, dp(4))
         }
         wordPanel.addView(ghostWordText)
-
-        val hint = TextView(this).apply {
-            text = "단어 및 음성 출력"
-            textSize = 10f
-            setTextColor(Color.LTGRAY)
-            gravity = Gravity.CENTER
-        }
-        wordPanel.addView(hint)
         content.addView(wordPanel, LinearLayout.LayoutParams(-1, -2).apply {
             setMargins(0, 0, 0, dp(12))
         })
 
-        addPanelText(
-            "EMF",
-            "자기장 변화 감지"
-        )
+        val logTitle = TextView(this).apply {
+            text = "DETECTION HISTORY"
+            textSize = 11f
+            letterSpacing = 1.2f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(accentColor)
+            setPadding(dp(3), dp(4), dp(3), dp(7))
+        }
+        content.addView(logTitle)
+        ghostLogContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundedBackground(panelColor, 14)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+        }
+        content.addView(ghostLogContainer, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(0, 0, 0, dp(12))
+        })
+        renderGhostWordLogs()
+
+        val spacer = View(this)
+        content.addView(spacer, LinearLayout.LayoutParams(1, 0, 1f))
+        detectionButton = Button(this).apply {
+            text = if (detectionRunning) "탐지 중지" else "탐지 실시"
+            textSize = 15f
+            isAllCaps = false
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.BLACK)
+            background = roundedBackground(if (detectionRunning) Color.rgb(235, 65, 65) else accentColor, 16)
+            setOnClickListener {
+                detectionRunning = !detectionRunning
+                if (!detectionRunning) {
+                    ghostTts?.stop()
+                    sensorStatusText.text = "STANDBY"
+                } else {
+                    sensorStatusText.text = "SCANNING"
+                }
+                text = if (detectionRunning) "탐지 중지" else "탐지 실시"
+                background = roundedBackground(if (detectionRunning) Color.rgb(235, 65, 65) else accentColor, 16)
+            }
+        }
+        content.addView(detectionButton, LinearLayout.LayoutParams(-1, dp(54)).apply {
+            setMargins(dp(4), dp(4), dp(4), dp(14))
+        })
     }
+
+    private fun saveGhostWordLog(word: String, fieldValue: Float, deviation: Float) {
+        val level = when {
+            deviation >= 20f -> "CRITICAL"
+            deviation >= 10f -> "HIGH"
+            else -> "ELEVATED"
+        }
+        ghostWordLogs.add(0, GhostWordLog(System.currentTimeMillis(), word, fieldValue, deviation, level))
+        while (ghostWordLogs.size > 100) ghostWordLogs.removeAt(ghostWordLogs.lastIndex)
+        val array = JSONArray()
+        ghostWordLogs.forEach { item ->
+            array.put(JSONObject().apply {
+                put("timestamp", item.timestamp); put("word", item.word)
+                put("field", item.fieldValue.toDouble()); put("deviation", item.deviation.toDouble())
+                put("level", item.level)
+            })
+        }
+        ghostLogPreferences?.edit()?.putString("word_logs", array.toString())?.apply()
+        renderGhostWordLogs()
+    }
+
+    private fun loadGhostWordLogs() {
+        ghostWordLogs.clear()
+        val raw = ghostLogPreferences?.getString("word_logs", null) ?: return
+        try {
+            val array = JSONArray(raw)
+            for (i in 0 until array.length()) {
+                val o = array.getJSONObject(i)
+                ghostWordLogs.add(GhostWordLog(o.optLong("timestamp"), o.optString("word"),
+                    o.optDouble("field").toFloat(), o.optDouble("deviation").toFloat(), o.optString("level")))
+            }
+        } catch (_: Exception) { ghostWordLogs.clear() }
+    }
+
+    private fun renderGhostWordLogs() {
+        val container = ghostLogContainer ?: return
+        container.removeAllViews()
+        if (ghostWordLogs.isEmpty()) {
+            container.addView(TextView(this).apply {
+                text = "기록 없음"; textSize = 12f; setTextColor(Color.GRAY); gravity = Gravity.CENTER
+                setPadding(0, dp(12), 0, dp(12))
+            })
+            return
+        }
+        val formatter = SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault())
+        ghostWordLogs.take(8).forEach { item ->
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, dp(7), 0, dp(7)) }
+            val left = TextView(this).apply {
+                text = "${formatter.format(Date(item.timestamp))}  ${item.word}"
+                textSize = 12f; setTextColor(Color.WHITE)
+            }
+            val right = TextView(this).apply {
+                text = "${item.fieldValue.formatOne()} μT · ${item.level}"
+                textSize = 10f; setTextColor(accentColor); gravity = Gravity.RIGHT
+            }
+            row.addView(left, LinearLayout.LayoutParams(0, -2, 1f))
+            row.addView(right)
+            container.addView(row)
+            val divider = View(this).apply { setBackgroundColor(Color.rgb(35, 60, 43)) }
+            container.addView(divider, LinearLayout.LayoutParams(-1, dp(1)))
+        }
+    }
+
+    private fun Float.formatOne(): String = String.format(Locale.US, "%.1f", this)
 
     private fun maybeShowGhostWord(deviation: Float) {
         val now = System.currentTimeMillis()
@@ -2102,6 +2230,7 @@ class MainActivity : Activity(), SensorEventListener {
             val previous = ghostWordText?.text?.toString()
             val candidates = words.filter { it != previous }
             val chosen = (candidates.ifEmpty { words }).random()
+            saveGhostWordLog(chosen, currentValue, deviation)
             runOnUiThread {
                 val wordColor = when {
                     deviation >= 18f -> Color.rgb(255, 90, 110)
@@ -2277,21 +2406,10 @@ class MainActivity : Activity(), SensorEventListener {
             }
         }
         voicePanel.addView(voiceSwitch)
-        val voiceHint = TextView(this).apply {
-            text = "그 목소리를 들을 것인가."
-            textSize = 11f
-            setTextColor(Color.LTGRAY)
-            setPadding(0, dp(8), 0, 0)
-        }
-        voicePanel.addView(voiceHint)
         content.addView(voicePanel, LinearLayout.LayoutParams(-1, -2).apply {
             setMargins(0, 0, 0, dp(12))
         })
 
-        addPanelText(
-            "WARNING",
-            "문을 열기 전, 안쪽에서 들리는 소리에 귀 기울이지 마라."
-        )
     }
 
     private fun addStoreItem(title: String, description: String, symbol: String) {
@@ -2397,15 +2515,13 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun addHeading(text: String) {
         val heading = TextView(this).apply {
-            this.text = text
-            textSize = 15f
+            this.text = text.uppercase(Locale.ROOT)
+            textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
-            letterSpacing = 1.2f
+            letterSpacing = 1.5f
             setTextColor(accentColor)
-            setShadowLayer(dp(6).toFloat(), 0f, 0f, Color.rgb(15, 180, 55))
-            setPadding(dp(4), dp(14), dp(4), dp(12))
+            setPadding(dp(5), dp(5), dp(5), dp(10))
         }
-
         content.addView(heading)
     }
 
@@ -2442,7 +2558,8 @@ class MainActivity : Activity(), SensorEventListener {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(15), dp(14), dp(15), dp(14))
-            background = roundedBackground(panelColor, 14)
+            background = roundedBackground(Color.rgb(4, 14, 8), 16)
+            elevation = dp(2).toFloat()
         }
     }
 
