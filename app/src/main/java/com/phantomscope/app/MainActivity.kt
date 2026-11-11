@@ -34,6 +34,8 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.MediaPlayer
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.view.ViewGroup
 import android.graphics.drawable.ColorDrawable
 import com.google.mlkit.vision.common.InputImage
@@ -71,8 +73,8 @@ data class InvestigationRecord(
 class MainActivity : Activity(), SensorEventListener {
 
     private val backgroundColor = Color.rgb(8, 10, 15)
-    private val panelColor = Color.rgb(20, 23, 31)
-    private val accentColor = Color.rgb(70, 220, 150)
+    private val panelColor = Color.rgb(9, 19, 14)
+    private val accentColor = Color.rgb(80, 255, 105)
     private val warningColor = Color.rgb(230, 55, 65)
 
     private lateinit var content: LinearLayout
@@ -98,6 +100,9 @@ class MainActivity : Activity(), SensorEventListener {
     private var ghostWordText: TextView? = null
     private var settingsPreferences: SharedPreferences? = null
     private var selectedLanguage = "ko"
+    private var ghostSpeechEnabled = true
+    private var ghostTts: TextToSpeech? = null
+    @Volatile private var ghostTtsReady = false
     private var lastGhostWordTime = 0L
     private var ghostWordArmed = true
     private val ghostWordCooldownMs = 6500L
@@ -180,8 +185,10 @@ class MainActivity : Activity(), SensorEventListener {
         val title = TextView(this).apply {
             text = "PHANTOM SCOPE"
             textSize = 25f
-            setTextColor(Color.WHITE)
-            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(accentColor)
+            typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD_ITALIC)
+            setShadowLayer(dp(10).toFloat(), 0f, 0f, Color.rgb(25, 255, 75))
+            letterSpacing = 0.08f
             gravity = Gravity.CENTER
         }
 
@@ -191,7 +198,7 @@ class MainActivity : Activity(), SensorEventListener {
             text = "HORROR INVESTIGATION SYSTEM"
             textSize = 10f
             letterSpacing = 2f
-            setTextColor(warningColor)
+            setTextColor(accentColor)
             gravity = Gravity.CENTER
         }
 
@@ -209,7 +216,8 @@ class MainActivity : Activity(), SensorEventListener {
                 text = name
                 textSize = 11f
                 isAllCaps = false
-                setTextColor(Color.WHITE)
+                setTextColor(accentColor)
+                background = roundedBackground(panelColor, 12)
                 setOnClickListener { showPage(index) }
 
                 tabRow.addView(
@@ -261,6 +269,8 @@ class MainActivity : Activity(), SensorEventListener {
         soundPreferences = getSharedPreferences("phantom_scope_sound_events", MODE_PRIVATE)
         settingsPreferences = getSharedPreferences("phantom_scope_settings", MODE_PRIVATE)
         selectedLanguage = settingsPreferences?.getString("ghost_language", "ko") ?: "ko"
+        ghostSpeechEnabled = settingsPreferences?.getBoolean("ghost_speech_enabled", true) ?: true
+        initializeGhostVoice()
         loadInvestigationRecords()
         loadSoundEvents()
         loadSavedAudioFiles()
@@ -494,8 +504,8 @@ class MainActivity : Activity(), SensorEventListener {
 
         if (!cameraFullscreen) {
             tabButtons.forEachIndexed { i, button ->
-                button.setBackgroundColor(if (i == index) warningColor else panelColor)
-                button.setTextColor(Color.WHITE)
+                button.background = roundedBackground(if (i == index) Color.rgb(20, 75, 35) else panelColor, 12)
+                button.setTextColor(if (i == index) accentColor else Color.LTGRAY)
             }
         }
 
@@ -2095,17 +2105,70 @@ class MainActivity : Activity(), SensorEventListener {
                     scaleY = 0.92f
                     animate().scaleX(1f).scaleY(1f).setDuration(260L).start()
                 }
+                speakGhostWord(chosen)
+            }
+        }
+    }
+
+    private fun initializeGhostVoice() {
+        ghostTts?.shutdown()
+        ghostTtsReady = false
+        ghostTts = TextToSpeech(this) { status ->
+            ghostTtsReady = status == TextToSpeech.SUCCESS
+            if (ghostTtsReady) configureGhostVoiceLanguage()
+        }
+    }
+
+    private fun configureGhostVoiceLanguage() {
+        val locale = when (selectedLanguage) {
+            "en" -> Locale.US
+            "ja" -> Locale.JAPAN
+            "zh" -> Locale.SIMPLIFIED_CHINESE
+            "es" -> Locale("es", "ES")
+            else -> Locale.KOREAN
+        }
+        val engine = ghostTts ?: return
+        val availability = engine.isLanguageAvailable(locale)
+        if (availability >= TextToSpeech.LANG_AVAILABLE) {
+            engine.language = locale
+        } else {
+            engine.language = Locale.KOREAN
+        }
+        engine.setSpeechRate(0.88f)
+        engine.setPitch(0.82f)
+    }
+
+    private fun speakGhostWord(word: String) {
+        if (!ghostSpeechEnabled || !ghostTtsReady) return
+        runOnUiThread {
+            try {
+                configureGhostVoiceLanguage()
+                ghostTts?.speak(word, TextToSpeech.QUEUE_FLUSH, null, "phantom-${System.currentTimeMillis()}")
+            } catch (e: Exception) {
+                android.util.Log.w("PhantomVoice", "TTS playback failed", e)
             }
         }
     }
 
     private fun ghostWordsForLanguage(language: String): List<String> {
+        // 한국어 기본 단어 100개. 다른 언어는 해당 언어의 기본 단어 목록을 사용합니다.
         return when (language) {
-            "en" -> listOf("HELP", "LEAVE", "BEHIND", "WHO", "RUN", "DANGER", "HERE", "WHY", "COLD", "STOP", "COME", "NO")
-            "ja" -> listOf("たすけて", "にげて", "うしろ", "だれ", "あぶない", "ここ", "なぜ", "さむい", "やめて", "きて", "いいえ")
-            "zh" -> listOf("救命", "离开", "身后", "谁", "危险", "这里", "为什么", "冷", "停止", "过来", "不")
-            "es" -> listOf("AYUDA", "VETE", "DETRÁS", "QUIÉN", "PELIGRO", "AQUÍ", "POR QUÉ", "FRÍO", "PARA", "VEN", "NO")
-            else -> listOf("도와줘", "가지 마", "뒤에", "누구야", "위험해", "여기야", "왜", "추워", "그만해", "이리 와", "아니", "살려줘")
+            "en" -> listOf("HELP", "LEAVE", "BEHIND", "WHO", "RUN", "DANGER", "HERE", "WHY", "COLD", "STOP", "COME", "NO", "GO AWAY", "DON'T MOVE", "LOOK BACK", "I'M HERE", "LISTEN", "HIDE", "FOUND YOU", "GOODBYE")
+            "ja" -> listOf("たすけて", "にげて", "うしろ", "だれ", "あぶない", "ここ", "なぜ", "さむい", "やめて", "きて", "いかないで", "みて", "きこえる", "かくれて", "みつけた")
+            "zh" -> listOf("救命", "离开", "身后", "谁", "危险", "这里", "为什么", "冷", "停止", "过来", "不要走", "看后面", "听着", "躲起来", "我看见你了")
+            "es" -> listOf("AYUDA", "VETE", "DETRÁS", "QUIÉN", "PELIGRO", "AQUÍ", "POR QUÉ", "FRÍO", "PARA", "VEN", "NO TE VAYAS", "MIRA ATRÁS", "ESCUCHA", "ESCÓNDETE", "TE ENCONTRÉ")
+            else -> listOf(
+                "도와줘", "살려줘", "여기", "여기야", "저기", "뒤에", "뒤돌아봐", "누구야", "누가 있어", "가지 마",
+                "가지마", "그만해", "멈춰", "도망쳐", "숨지 마", "숨었어", "찾아봐", "찾았다", "보고 있어", "보고 있어요",
+                "듣고 있어", "들려", "소리가 나", "조용히", "쉿", "왜", "누구", "어디야", "어디 있어", "이리 와",
+                "가까이 와", "저리 가", "나가", "들어와", "문 열어", "문 닫아", "창문", "복도", "계단", "지하실",
+                "천장", "벽 뒤", "침대 밑", "옷장 안", "어둠 속", "그림자", "검은 그림자", "발자국", "발소리", "노크 소리",
+                "속삭임", "숨소리", "울음소리", "웃음소리", "기척", "차가워", "추워", "춥다", "뜨거워", "아파",
+                "무서워", "외로워", "혼자야", "혼자가 아니야", "나를 봐", "눈을 감아", "눈을 떠", "돌아와", "기다려", "기억해",
+                "잊지 마", "내 이름", "이름을 말해", "말해 봐", "대답해", "응답해", "침묵", "위험해", "위험", "살아 있어",
+                "죽지 않았어", "끝나지 않았어", "끝났어", "이제 가", "곧 와", "가까워", "멀어", "따라와", "혼령", "귀신",
+                "유령", "악몽", "저주", "봉인", "문턱", "이곳에 있어", "여기에 있어", "안녕", "잘 가", "안 돼"
+            )
         }
     }
 
@@ -2140,6 +2203,7 @@ class MainActivity : Activity(), SensorEventListener {
                 ) {
                     selectedLanguage = languageCodes[position]
                     settingsPreferences?.edit()?.putString("ghost_language", selectedLanguage)?.apply()
+                    configureGhostVoiceLanguage()
                     ghostWordText?.text = "탐사 대기 중..."
                 }
             }
@@ -2148,6 +2212,30 @@ class MainActivity : Activity(), SensorEventListener {
             setMargins(0, dp(12), 0, 0)
         })
         content.addView(languagePanel, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(0, 0, 0, dp(12))
+        })
+
+        val voicePanel = makePanel()
+        val voiceSwitch = Switch(this).apply {
+            text = "유령 단어 음성 출력"
+            textSize = 15f
+            setTextColor(Color.WHITE)
+            isChecked = ghostSpeechEnabled
+            setOnCheckedChangeListener { _, checked ->
+                ghostSpeechEnabled = checked
+                settingsPreferences?.edit()?.putBoolean("ghost_speech_enabled", checked)?.apply()
+                if (!checked) ghostTts?.stop()
+            }
+        }
+        voicePanel.addView(voiceSwitch)
+        val voiceHint = TextView(this).apply {
+            text = "자기장 감지 후 단어가 나타날 때 기기 음성으로 읽어줍니다. 음성은 기기에 설치된 TTS 엔진과 언어 데이터에 따라 달라집니다."
+            textSize = 11f
+            setTextColor(Color.LTGRAY)
+            setPadding(0, dp(8), 0, 0)
+        }
+        voicePanel.addView(voiceHint)
+        content.addView(voicePanel, LinearLayout.LayoutParams(-1, -2).apply {
             setMargins(0, 0, 0, dp(12))
         })
 
@@ -2270,7 +2358,8 @@ class MainActivity : Activity(), SensorEventListener {
             textSize = 15f
             typeface = Typeface.DEFAULT_BOLD
             letterSpacing = 1.2f
-            setTextColor(warningColor)
+            setTextColor(accentColor)
+            setShadowLayer(dp(6).toFloat(), 0f, 0f, Color.rgb(15, 180, 55))
             setPadding(dp(4), dp(14), dp(4), dp(12))
         }
 
@@ -2321,7 +2410,7 @@ class MainActivity : Activity(), SensorEventListener {
         return GradientDrawable().apply {
             setColor(color)
             cornerRadius = dp(radius).toFloat()
-            setStroke(dp(1), Color.rgb(48, 43, 52))
+            setStroke(dp(1), Color.rgb(35, 125, 65))
         }
     }
 
@@ -2334,6 +2423,16 @@ class MainActivity : Activity(), SensorEventListener {
         accuracy: Int
     ) {
         // 센서 정확도 변경 시 별도 처리 없음
+    }
+
+    override fun onDestroy() {
+        try {
+            ghostTts?.stop()
+            ghostTts?.shutdown()
+            ghostTts = null
+            ghostTtsReady = false
+        } catch (_: Exception) { }
+        super.onDestroy()
     }
 }
 
