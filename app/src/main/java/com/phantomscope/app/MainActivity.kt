@@ -2190,7 +2190,7 @@ class MainActivity : Activity(), SensorEventListener {
     private fun showPremiumRequired(feature: String) {
         android.app.AlertDialog.Builder(this)
             .setTitle("PREMIUM 기능")
-            .setMessage("$feature은(는) PHANTOM SCOPE PREMIUM 전용 기능입니다. 설정 탭에서 프리미엄 상품을 확인해 주세요.")
+            .setMessage("${feature} 기능은 현재 사용할 수 없습니다.")
             .setNegativeButton("나중에", null)
             .setPositiveButton("설정 열기") { _, _ -> showPage(2) }
             .show()
