@@ -1133,11 +1133,11 @@ class MainActivity : Activity(), SensorEventListener {
             }
             val output = java.io.ByteArrayOutputStream()
             photoBitmap.compress(Bitmap.CompressFormat.JPEG, 94, output)
-            poseBitmap.recycle()
+            poseBitmap?.takeIf { !it.isRecycled }?.recycle()
             photoBitmap.recycle()
             output.toByteArray()
         } catch (_: Exception) {
-            try { poseBitmap.recycle(); decoded.recycle() } catch (_: Exception) { }
+            try { poseBitmap?.takeIf { !it.isRecycled }?.recycle(); if (!decoded.isRecycled) decoded.recycle() } catch (_: Exception) { }
             jpegBytes
         }
     }
