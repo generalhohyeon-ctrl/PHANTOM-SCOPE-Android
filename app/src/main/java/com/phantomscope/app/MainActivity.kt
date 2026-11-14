@@ -144,7 +144,7 @@ class MainActivity : Activity(), SensorEventListener {
     private var radioSweepRunning = false
     private var radioBatchStart = 0
     private var radioBatchSwitchCount = 0
-    private val radioBatchSize = 8
+    private val radioBatchSize = 10
     private var radioLoading = false
     private var radioStatusView: TextView? = null
     private var radioCurrentStationView: TextView? = null
@@ -413,7 +413,7 @@ class MainActivity : Activity(), SensorEventListener {
         if (detectionRunning) {
             // 기존 조사 기록 판정은 유지하고, 음성 출력은 기준값 대비 실제 변화량으로 별도 판정합니다.
             handleAnomaly(deviation, magnitude)
-            if (voiceBaselineReady) maybeShowGhostWord(abs(magnitude - voiceBaseline))
+            maybeShowGhostWord(magnitude)
         } else if (voiceBaselineReady) {
             // 탐지 대기 중에도 기준값을 아주 천천히 보정해 장소 변화에 적응시킵니다.
             voiceBaseline += (magnitude - voiceBaseline) * 0.01f
@@ -2255,54 +2255,38 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun Float.formatOne(): String = String.format(Locale.US, "%.1f", this)
 
-    private fun maybeShowGhostWord(deviation: Float) {
-        val sensitivityPercent = (settingsPreferences?.getInt("emf_sensitivity_percent", 49) ?: 49)
-            .coerceIn(0, 99)
-        val sensitivity = sensitivityPercent / 99f
-
-        // 민감도 53%일 때 약 9.5μT 이상의 기준값 이탈이 있어야 음성 후보가 됩니다.
-        // 낮은 민감도는 더 큰 변화가 필요하고, 높은 민감도는 조금 더 작은 변화를 허용합니다.
-        val voiceTriggerThreshold = 14f - (sensitivity * 8.5f)
-        val rearmThreshold = voiceTriggerThreshold * 0.55f
-
-        // 작은 흔들림은 무시하고, 자기장이 충분히 안정된 뒤에만 다음 이벤트를 허용합니다.
-        if (deviation < rearmThreshold) {
+    private fun maybeShowGhostWord(fieldStrength: Float) {
+        // 사용자 요청: 절대 자기장 세기 35μT를 고정 음성 감지 기준으로 사용합니다.
+        // 35μT 미만으로 내려가면 다음 감지 이벤트를 다시 허용합니다.
+        val voiceTriggerThreshold = 35f
+        if (fieldStrength < voiceTriggerThreshold) {
             ghostWordArmed = true
-            // 정상 상태에서는 주변 환경 변화에 기준값을 천천히 맞춥니다.
-            voiceBaseline += (currentValue - voiceBaseline) * 0.015f
             return
         }
-        if (deviation < voiceTriggerThreshold) return
 
-        // 한 번의 자기장 상승 구간에서는 한 번만 확률 판정을 합니다.
         if (!ghostWordArmed) return
         if (System.currentTimeMillis() - lastGhostWordTime < ghostWordCooldownMs) return
         ghostWordArmed = false
 
-        // 음성 출력 후 시간 대기(쿨다운)는 두지 않습니다.
-        // 대신 자기장이 안정 구간으로 복귀해야 다음 이벤트가 재무장되며,
-        // 이벤트당 확률을 낮춰 연속 발화를 억제합니다.
-        // 민감도 53%에서 임계값 직후 약 7~8%, 큰 변화에서도 최대 25%입니다.
-        val strength = ((deviation / voiceTriggerThreshold) - 1f).coerceIn(0f, 2f) / 2f
-        val probability = (0.025f + sensitivity * 0.10f + strength * 0.15f)
-            .coerceIn(0.03f, 0.25f)
+        // 민감도 50%일 때 30% 확률. 민감도가 높아져도 요청한 30%를 넘지 않습니다.
+        val sensitivityPercent = (settingsPreferences?.getInt("emf_sensitivity_percent", 49) ?: 49)
+            .coerceIn(0, 99) + 1
+        val probability = (0.30f * (sensitivityPercent / 50f)).coerceIn(0f, 0.30f)
         if (Math.random().toFloat() >= probability) return
 
         val words = ghostWordsForLanguage(selectedLanguage)
-        // 직전에 말한 단어뿐 아니라 최근 5개 단어도 후보에서 제외해 반복감을 줄입니다.
         val candidates = words.filter { it !in recentGhostWords }
         val chosen = (candidates.ifEmpty { words.filter { it != recentGhostWords.lastOrNull() }.ifEmpty { words } }).random()
         recentGhostWords.addLast(chosen)
         while (recentGhostWords.size > 5) recentGhostWords.removeFirst()
         lastGhostWordTime = System.currentTimeMillis()
-        saveGhostWordLog(chosen, currentValue, deviation)
+        saveGhostWordLog(chosen, currentValue, fieldStrength - voiceTriggerThreshold)
 
         runOnUiThread {
-            // 단어가 실제로 출력될 때만 짧은 감지음을 재생합니다.
             try { detectionTone?.startTone(ToneGenerator.TONE_PROP_ACK, 210) } catch (_: Exception) { }
             val wordColor = when {
-                deviation >= voiceTriggerThreshold * 2.5f -> Color.rgb(255, 90, 110)
-                deviation >= voiceTriggerThreshold * 1.7f -> Color.rgb(255, 170, 75)
+                fieldStrength >= 70f -> Color.rgb(255, 90, 110)
+                fieldStrength >= 50f -> Color.rgb(255, 170, 75)
                 else -> accentColor
             }
             listOfNotNull(
@@ -2534,7 +2518,7 @@ class MainActivity : Activity(), SensorEventListener {
         addHeading("INTERNET RADIO SWEEP")
         addPanelText(
             "SPIRIT BOX · 인터넷 라디오 스윕",
-            "전 세계 인터넷 라디오 방송을 최대 1,000개까지 검색합니다. 메모리와 연결 안정성을 위해 한 번에 8개 스트림만 준비하고, 채널 묶음을 순환하며 스캔합니다. 실제 RF 주파수 튜닝이 아닌 인터넷 방송 전환 방식입니다."
+            "전 세계 인터넷 라디오 방송 중 10개 채널을 시작할 때 한 번만 검색합니다. 10개 스트림을 준비한 뒤에는 재검색이나 재연결 없이 정지 버튼을 누를 때까지 계속 순환 스왑합니다. 실제 RF 주파수 튜닝이 아닌 인터넷 방송 전환 방식입니다."
         )
 
         val statusPanel = makePanel()
@@ -2672,7 +2656,7 @@ class MainActivity : Activity(), SensorEventListener {
 
         addPanelText(
             "수신 방식 및 한계",
-            "전 세계 언어·국가·음악 장르·토크·뉴스 방송을 혼합 검색합니다. 목록은 최대 1,000개이며, 실제 재생 가능한 방송은 네트워크와 방송국 상태에 따라 달라집니다. 엔터테인먼트용 오디오 스캔으로 초자연 현상이나 음성의 출처를 검증하지 않습니다."
+            "전 세계 인터넷 방송 중 10개 채널을 시작할 때 한 번만 불러옵니다. 이후에는 새로 검색하지 않고 10개 채널을 계속 순환합니다. 정지 버튼을 누르면 스왑이 멈춥니다. 엔터테인먼트용 오디오 스캔입니다."
         )
     }
 
@@ -2683,23 +2667,10 @@ class MainActivity : Activity(), SensorEventListener {
         radioStatusView?.text = "전 세계 인터넷 방송 검색 중…"
         radioStartButton?.isEnabled = false
         Thread {
-            // 다양한 국가·언어·음악/토크 장르를 섞어 최대 1,000개까지 확보합니다.
-            val queries = listOf(
-                "hidebroken=true&is_https=true&order=random&limit=1000",
-                "tag=music&hidebroken=true&is_https=true&order=random&limit=300",
-                "tag=pop&hidebroken=true&is_https=true&order=random&limit=200",
-                "tag=rock&hidebroken=true&is_https=true&order=random&limit=150",
-                "tag=talk&hidebroken=true&is_https=true&order=random&limit=150",
-                "tag=news&hidebroken=true&is_https=true&order=random&limit=150"
-            )
-            val merged = LinkedHashMap<String, RadioStation>()
-            for (query in queries) {
-                if (merged.size >= 1000) break
-                fetchRadioStations(query, (1000 - merged.size).coerceAtMost(1000)).forEach { station ->
-                    if (station.streamUrl.isNotBlank()) merged.putIfAbsent(station.streamUrl, station)
-                }
-            }
-            val stations = merged.values.toList().take(1000)
+            // 시작 시 딱 한 번 10개 채널만 검색합니다. 스왑 중에는 재검색하지 않습니다.
+            val stations = fetchRadioStations(
+                "hidebroken=true&is_https=true&order=random&limit=10", 10
+            ).distinctBy { it.streamUrl }.take(10)
             runOnUiThread {
                 radioLoading = false
                 radioStartButton?.isEnabled = true
@@ -2714,7 +2685,7 @@ class MainActivity : Activity(), SensorEventListener {
                 radioStationListView?.text = radioStations.take(30).mapIndexed { i, station ->
                     "${i + 1}. ${station.name}"
                 }.joinToString("\n") + if (radioStations.size > 30) "\n… 외 ${radioStations.size - 30}개 방송" else ""
-                radioStatusView?.text = "${radioStations.size}개 글로벌 방송 확보 · 첫 8개 채널 연결 중…"
+                radioStatusView?.text = "${radioStations.size}개 채널 확보 · 10개 채널 연결 중…"
                 prepareRadioPlayers()
             }
         }.start()
@@ -2757,9 +2728,8 @@ class MainActivity : Activity(), SensorEventListener {
         if (radioStations.isEmpty()) return
         radioReadyIndexes.clear()
         radioAttemptedIndexes.clear()
-        val batchEnd = (radioBatchStart + radioBatchSize).coerceAtMost(radioStations.size)
-        val batch = radioStations.subList(radioBatchStart, batchEnd).toList()
-        radioStatusView?.text = "전체 ${radioStations.size}개 중 ${radioBatchStart + 1}~${batchEnd}번 방송 연결 중…"
+        val batch = radioStations.take(10)
+        radioStatusView?.text = "10개 채널 연결 중…"
         batch.forEachIndexed { localIndex, station ->
             val player = MediaPlayer()
             radioPlayers.add(player)
@@ -2804,7 +2774,7 @@ class MainActivity : Activity(), SensorEventListener {
             radioStatusView?.text = "연결 가능한 방송이 없습니다. 새로고침을 시도하세요."
             return
         }
-        radioStatusView?.text = "${radioReadyIndexes.size}개 채널 연결 완료 · 전체 ${radioStations.size}개 중 ${radioBatchStart + 1}~${(radioBatchStart + radioPlayers.size).coerceAtMost(radioStations.size)}번 스캔"
+        radioStatusView?.text = "${radioReadyIndexes.size}개 채널 연결 완료 · 정지 버튼을 누를 때까지 반복 스왑"
         radioBatchSwitchCount = 0
         radioSweepRunning = true
         radioCurrentIndex = if (radioDirectionForward) -1 else 0
@@ -2837,12 +2807,9 @@ class MainActivity : Activity(), SensorEventListener {
         radioCurrentIndex = next
         val globalIndex = radioBatchStart + next
         radioCurrentStationView?.text = "CURRENT CHANNEL  ${globalIndex + 1}/${radioStations.size} · ${radioStations.getOrNull(globalIndex)?.name ?: "—"}"
+        // 준비된 10개 채널만 정지 버튼을 누를 때까지 계속 순환합니다.
         radioBatchSwitchCount++
-        if (radioBatchSwitchCount >= radioReadyIndexes.size && radioStations.size > radioBatchSize) {
-            scheduleNextRadioBatch()
-        } else {
-            scheduleNextRadioChannel()
-        }
+        scheduleNextRadioChannel()
     }
 
     private fun scheduleNextRadioBatch() {
@@ -2997,7 +2964,7 @@ class MainActivity : Activity(), SensorEventListener {
         }
         sensitivityPanel.addView(sensitivitySeek)
         val sensitivityHint = TextView(this).apply {
-            text = "작은 자기장 흔들림은 무시하고, 주변 기준값에서 큰 변화가 감지될 때만 낮은 확률로 음성이 출력됩니다."
+            text = "고정 자기장 기준 35μT 이상에서 음성 감지를 시도합니다. 민감도 50%일 때 단어 출력 확률은 30%이며, 실제 출력에는 5초 대기 시간이 적용됩니다."
             textSize = 10.5f
             setTextColor(Color.rgb(145, 165, 150))
             setPadding(0, dp(5), 0, 0)
