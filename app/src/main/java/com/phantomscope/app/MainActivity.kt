@@ -144,7 +144,7 @@ class MainActivity : Activity(), SensorEventListener {
     private var radioSweepRunning = false
     private var radioBatchStart = 0
     private var radioBatchSwitchCount = 0
-    private val radioBatchSize = 10
+    private val radioBatchSize = 7
     private var radioLoading = false
     private var radioStatusView: TextView? = null
     private var radioCurrentStationView: TextView? = null
@@ -306,7 +306,7 @@ class MainActivity : Activity(), SensorEventListener {
         radioDirectionForward = settingsPreferences?.getBoolean("radio_forward", true) ?: true
         radioSweepMs = settingsPreferences?.getInt("radio_sweep_ms", 900)?.coerceIn(200, 5000) ?: 900
         try { detectionTone = ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 85) } catch (_: Exception) { detectionTone = null }
-        val savedSensitivity = settingsPreferences?.getInt("emf_sensitivity_percent", -1) ?: -1
+        val savedSensitivity = settingsPreferences?.getInt("emf_sensitivity_percent", 52) ?: 52
         anomalyTriggerThreshold = if (savedSensitivity >= 0) {
             10f - (savedSensitivity / 99f) * 9.5f
         } else {
@@ -2256,22 +2256,25 @@ class MainActivity : Activity(), SensorEventListener {
     private fun Float.formatOne(): String = String.format(Locale.US, "%.1f", this)
 
     private fun maybeShowGhostWord(fieldStrength: Float) {
-        // 사용자 요청: 절대 자기장 세기 35μT를 고정 음성 감지 기준으로 사용합니다.
-        // 35μT 미만으로 내려가면 다음 감지 이벤트를 다시 허용합니다.
-        val voiceTriggerThreshold = 35f
-        if (fieldStrength < voiceTriggerThreshold) {
+        // 절대 자기장 기준은 20μT로 고정하고, 주변 기준값 대비 변화량으로 민감도를 판정합니다.
+        val fixedMagneticThreshold = 20f
+        val sensitivityPercent = (settingsPreferences?.getInt("emf_sensitivity_percent", 52) ?: 52)
+            .coerceIn(0, 99) + 1
+        // 민감도 53%에서 기준값 대비 약 5μT 변화가 감지 기준입니다.
+        val detectionDeltaThreshold = (5f * (53f / sensitivityPercent)).coerceIn(1f, 10f)
+        val magneticDelta = abs(fieldStrength - voiceBaseline)
+
+        if (!voiceBaselineReady || fieldStrength < fixedMagneticThreshold || magneticDelta < detectionDeltaThreshold * 0.55f) {
             ghostWordArmed = true
             return
         }
-
+        if (magneticDelta < detectionDeltaThreshold) return
         if (!ghostWordArmed) return
         if (System.currentTimeMillis() - lastGhostWordTime < ghostWordCooldownMs) return
         ghostWordArmed = false
 
-        // 민감도 50%일 때 30% 확률. 민감도가 높아져도 요청한 30%를 넘지 않습니다.
-        val sensitivityPercent = (settingsPreferences?.getInt("emf_sensitivity_percent", 49) ?: 49)
-            .coerceIn(0, 99) + 1
-        val probability = (0.30f * (sensitivityPercent / 50f)).coerceIn(0f, 0.30f)
+        // 민감도 53%에서 약 40% 확률, 민감도에 따라 조정하되 최대 65%로 제한합니다.
+        val probability = (0.40f * (sensitivityPercent / 53f)).coerceIn(0f, 0.65f)
         if (Math.random().toFloat() >= probability) return
 
         val words = ghostWordsForLanguage(selectedLanguage)
@@ -2280,7 +2283,7 @@ class MainActivity : Activity(), SensorEventListener {
         recentGhostWords.addLast(chosen)
         while (recentGhostWords.size > 5) recentGhostWords.removeFirst()
         lastGhostWordTime = System.currentTimeMillis()
-        saveGhostWordLog(chosen, currentValue, fieldStrength - voiceTriggerThreshold)
+        saveGhostWordLog(chosen, currentValue, magneticDelta)
 
         runOnUiThread {
             try { detectionTone?.startTone(ToneGenerator.TONE_PROP_ACK, 210) } catch (_: Exception) { }
@@ -2518,7 +2521,7 @@ class MainActivity : Activity(), SensorEventListener {
         addHeading("INTERNET RADIO SWEEP")
         addPanelText(
             "SPIRIT BOX · 인터넷 라디오 스윕",
-            "전 세계 인터넷 라디오 방송 중 10개 채널을 시작할 때 한 번만 검색합니다. 10개 스트림을 준비한 뒤에는 재검색이나 재연결 없이 정지 버튼을 누를 때까지 계속 순환 스왑합니다. 실제 RF 주파수 튜닝이 아닌 인터넷 방송 전환 방식입니다."
+            "짧은 음성 조각이 빠르게 바뀌며 단어처럼 들릴 수 있는 ‘범블비 효과’를 활용한 엔터테인먼트 기능입니다. 실제 영적 존재와의 통신을 입증하는 장비는 아닙니다."
         )
 
         val statusPanel = makePanel()
@@ -2530,7 +2533,7 @@ class MainActivity : Activity(), SensorEventListener {
             setTextColor(accentColor)
         }
         radioStatusView = TextView(this).apply {
-            text = "대기 중 · 방송 목록을 불러오려면 새로고침을 누르세요"
+            text = "대기 중 · 시작 버튼을 눌러 7개 채널을 불러오세요"
             textSize = 13f
             setTextColor(Color.WHITE)
             setPadding(0, dp(8), 0, dp(2))
@@ -2644,7 +2647,7 @@ class MainActivity : Activity(), SensorEventListener {
         })
         controlPanel.addView(controlRow)
         radioStationListView = TextView(this).apply {
-            text = "방송 목록이 아직 로드되지 않았습니다.\n인터넷 연결 후 시작 버튼을 눌러주세요."
+            text = "채널 목록이 아직 준비되지 않았습니다.\n인터넷 연결 후 시작 버튼을 눌러주세요."
             textSize = 11.5f
             setTextColor(Color.LTGRAY)
             setPadding(0, dp(10), 0, 0)
@@ -2656,7 +2659,7 @@ class MainActivity : Activity(), SensorEventListener {
 
         addPanelText(
             "수신 방식 및 한계",
-            "전 세계 인터넷 방송 중 10개 채널을 시작할 때 한 번만 불러옵니다. 이후에는 새로 검색하지 않고 10개 채널을 계속 순환합니다. 정지 버튼을 누르면 스왑이 멈춥니다. 엔터테인먼트용 오디오 스캔입니다."
+            "전 세계 인터넷 방송 중 7개 채널을 시작할 때 한 번만 불러옵니다. 이후에는 새로 검색하지 않고 7개 채널을 계속 순환합니다. 정지 버튼을 누르면 스왑이 멈춥니다. 엔터테인먼트용 오디오 스캔입니다."
         )
     }
 
@@ -2667,10 +2670,10 @@ class MainActivity : Activity(), SensorEventListener {
         radioStatusView?.text = "전 세계 인터넷 방송 검색 중…"
         radioStartButton?.isEnabled = false
         Thread {
-            // 시작 시 딱 한 번 10개 채널만 검색합니다. 스왑 중에는 재검색하지 않습니다.
+            // 시작 시 딱 한 번 7개 채널만 검색합니다. 스왑 중에는 재검색하지 않습니다.
             val stations = fetchRadioStations(
-                "hidebroken=true&is_https=true&order=random&limit=10", 10
-            ).distinctBy { it.streamUrl }.take(10)
+                "hidebroken=true&is_https=true&order=random&limit=7", 7
+            ).distinctBy { it.streamUrl }.take(7)
             runOnUiThread {
                 radioLoading = false
                 radioStartButton?.isEnabled = true
@@ -2682,10 +2685,8 @@ class MainActivity : Activity(), SensorEventListener {
                 radioStations.addAll(stations)
                 radioBatchStart = 0
                 radioBatchSwitchCount = 0
-                radioStationListView?.text = radioStations.take(30).mapIndexed { i, station ->
-                    "${i + 1}. ${station.name}"
-                }.joinToString("\n") + if (radioStations.size > 30) "\n… 외 ${radioStations.size - 30}개 방송" else ""
-                radioStatusView?.text = "${radioStations.size}개 채널 확보 · 10개 채널 연결 중…"
+                radioStationListView?.text = "채널 이름 비공개 · 총 ${radioStations.size}개 채널 준비"
+                radioStatusView?.text = "${radioStations.size}개 채널 확보 · 7개 채널 연결 중…"
                 prepareRadioPlayers()
             }
         }.start()
@@ -2729,7 +2730,7 @@ class MainActivity : Activity(), SensorEventListener {
         radioReadyIndexes.clear()
         radioAttemptedIndexes.clear()
         val batch = radioStations.take(10)
-        radioStatusView?.text = "10개 채널 연결 중…"
+        radioStatusView?.text = "7개 채널 연결 중…"
         batch.forEachIndexed { localIndex, station ->
             val player = MediaPlayer()
             radioPlayers.add(player)
@@ -2806,8 +2807,8 @@ class MainActivity : Activity(), SensorEventListener {
         }
         radioCurrentIndex = next
         val globalIndex = radioBatchStart + next
-        radioCurrentStationView?.text = "CURRENT CHANNEL  ${globalIndex + 1}/${radioStations.size} · ${radioStations.getOrNull(globalIndex)?.name ?: "—"}"
-        // 준비된 10개 채널만 정지 버튼을 누를 때까지 계속 순환합니다.
+        radioCurrentStationView?.text = "CURRENT CHANNEL  ${globalIndex + 1}/${radioStations.size}"
+        // 준비된 7개 채널만 정지 버튼을 누를 때까지 계속 순환합니다.
         radioBatchSwitchCount++
         scheduleNextRadioChannel()
     }
@@ -2929,7 +2930,7 @@ class MainActivity : Activity(), SensorEventListener {
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
         }
-        val savedPercent = settingsPreferences?.getInt("emf_sensitivity_percent", -1) ?: -1
+        val savedPercent = settingsPreferences?.getInt("emf_sensitivity_percent", 52) ?: 52
         val initialPercent = if (savedPercent >= 0) savedPercent else {
             (((10f - anomalyTriggerThreshold) / 9.5f) * 99f).roundToInt().coerceIn(0, 99)
         }
@@ -2949,7 +2950,7 @@ class MainActivity : Activity(), SensorEventListener {
                 override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                     val percent = progress + 1
                     // 민감도 값이 높을수록 감지 임계값이 낮아집니다.
-                    anomalyTriggerThreshold = 10f - (progress / 99f) * 9.5f
+                    anomalyTriggerThreshold = (5f * (53f / (progress + 1f))).coerceIn(1f, 10f)
                     sensitivityValue.text = "${percent}%"
                     if (fromUser) {
                         settingsPreferences?.edit()
@@ -2964,7 +2965,7 @@ class MainActivity : Activity(), SensorEventListener {
         }
         sensitivityPanel.addView(sensitivitySeek)
         val sensitivityHint = TextView(this).apply {
-            text = "고정 자기장 기준 35μT 이상에서 음성 감지를 시도합니다. 민감도 50%일 때 단어 출력 확률은 30%이며, 실제 출력에는 5초 대기 시간이 적용됩니다."
+            text = "자기장 절대 기준은 20μT로 고정됩니다. 민감도 53%에서는 기준값 대비 약 5μT 변화가 감지 기준이며, 음성 출력 확률은 약 40%입니다. 출력 후 5초 대기합니다."
             textSize = 10.5f
             setTextColor(Color.rgb(145, 165, 150))
             setPadding(0, dp(5), 0, 0)
@@ -2974,11 +2975,12 @@ class MainActivity : Activity(), SensorEventListener {
             setMargins(0, 0, 0, dp(12))
         })
 
-        addHeading("EQUIPMENT GUIDE")
+        addHeading("설정 탭 · 장비 가이드")
         addPanelText("EMF METER · 자기장 측정기", "주변 자기장 세기를 μT 단위로 측정합니다. 전기 배선, 모터, 스피커, 자석 등도 수치에 영향을 줍니다.")
         addPanelText("CAMERA · 영상 관측", "카메라 영상에서 인체 형태와 움직임을 분석합니다. 저조도·가림·카메라 흔들림은 오탐 또는 미탐의 원인이 될 수 있습니다.")
         addPanelText("AUDIO / EVP · 음향 기록", "마이크로 주변 소리를 수집하고 녹음합니다. 잡음 속 음성처럼 들리는 구간은 원본 녹음으로 재확인해야 합니다.")
-        addPanelText("RADIO SWEEP · 인터넷 방송 스캔", "여러 인터넷 라디오 스트림을 미리 연결하고 짧은 간격으로 재생 채널을 전환합니다. 실제 RF 주파수 튜닝과는 다른 방식입니다.")
+        addPanelText("SPIRIT BOX · 스피릿 박스", "짧은 음성 조각이 빠르게 바뀌며 단어처럼 들릴 수 있는 ‘범블비 효과’를 활용합니다. 오락·체험용 기능이며 영적 존재와의 통신을 증명하지는 않습니다.")
+        addPanelText("RADIO SWEEP · 인터넷 방송 스캔", "7개 인터넷 라디오 스트림을 한 번 불러온 뒤 정지 버튼을 누를 때까지 순서대로 전환합니다. 실제 RF 주파수 튜닝과는 다른 방식입니다.")
         addPanelText("DETECTION LOG · 조사 기록", "감지 시각, 자기장 변화량, 출력된 단어 및 저장된 증거 파일을 확인합니다. 기록은 앱 내부 저장소에 보관됩니다.")
 
     }
