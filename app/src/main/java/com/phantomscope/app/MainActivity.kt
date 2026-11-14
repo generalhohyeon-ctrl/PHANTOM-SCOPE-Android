@@ -46,6 +46,11 @@ import com.google.mlkit.vision.pose.PoseDetection
 import com.google.mlkit.vision.pose.PoseDetector
 import com.google.mlkit.vision.pose.defaults.PoseDetectorOptions
 import android.os.Process
+import android.os.Handler
+import android.os.Looper
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 import android.content.SharedPreferences
 import android.os.Bundle
 import android.graphics.*
@@ -63,6 +68,8 @@ import java.util.Date
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.*
+
+data class RadioStation(val name: String, val streamUrl: String, val stationUuid: String)
 
 data class GhostWordLog(val timestamp: Long, val word: String, val fieldValue: Float, val deviation: Float, val level: String)
 
@@ -108,9 +115,15 @@ class MainActivity : Activity(), SensorEventListener {
     private var ghostTts: TextToSpeech? = null
     private var detectionTone: ToneGenerator? = null
     @Volatile private var ghostTtsReady = false
-    private var lastGhostWordTime = 0L
     private var ghostWordArmed = true
-    private var ghostWordCooldownMs = 6500L
+    private var lastGhostWordTime = 0L
+    private val ghostWordCooldownMs = 5_000L
+    // 음성 감지는 고정 20μT가 아니라 앱 실행 중 측정한 주변 자기장 기준값과 비교합니다.
+    private var voiceBaselineTotal = 0f
+    private var voiceBaselineSamples = 0
+    private var voiceBaseline = 0f
+    private var voiceBaselineReady = false
+    private val recentGhostWords = ArrayDeque<String>()
     private val spectrumSamples = ArrayDeque<Float>()
     private var smoothedSpectrumValue = 0f
     private var lastSpectrumLevel = 0
@@ -119,6 +132,25 @@ class MainActivity : Activity(), SensorEventListener {
     private var ghostLogPreferences: SharedPreferences? = null
     private val ghostWordLogs = mutableListOf<GhostWordLog>()
     private var ghostLogContainer: LinearLayout? = null
+    // 인터넷 라디오 스윕: 여러 스트림을 미리 버퍼링한 뒤 출력 볼륨을 교대합니다.
+    private var radioDirectionForward = true
+    private var radioSweepMs = 900
+    private val radioHandler = Handler(Looper.getMainLooper())
+    private val radioStations = mutableListOf<RadioStation>()
+    private val radioPlayers = mutableListOf<MediaPlayer>()
+    private val radioReadyIndexes = mutableSetOf<Int>()
+    private val radioAttemptedIndexes = mutableSetOf<Int>()
+    private var radioCurrentIndex = -1
+    private var radioSweepRunning = false
+    private var radioBatchStart = 0
+    private var radioBatchSwitchCount = 0
+    private val radioBatchSize = 8
+    private var radioLoading = false
+    private var radioStatusView: TextView? = null
+    private var radioCurrentStationView: TextView? = null
+    private var radioStationListView: TextView? = null
+    private var radioStartButton: Button? = null
+    private var radioStopButton: Button? = null
     private val readings = mutableListOf<Float>()
     private lateinit var logPreferences: SharedPreferences
     private val investigationRecords = mutableListOf<InvestigationRecord>()
@@ -192,19 +224,13 @@ class MainActivity : Activity(), SensorEventListener {
         val backgroundBitmap = BitmapFactory.decodeResource(resources, R.drawable.phantom_background)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            // drawable-nodpi 리소스를 화면 전체에 한 번만 배치합니다.
-            // 배경 파일에는 상단 로고와 복도만 있고, 실제 버튼/패널은 아래 UI가 그립니다.
-            background = if (backgroundBitmap != null) {
-                BitmapDrawable(resources, backgroundBitmap).apply {
-                    gravity = Gravity.FILL
-                }
-            } else {
-                ColorDrawable(backgroundColor)
+            background = BitmapDrawable(resources, backgroundBitmap).apply {
+                gravity = Gravity.FILL
             }
             setPadding(dp(12), dp(4), dp(12), dp(6))
         }
 
-        val tabNames = listOf("■\n탐지", "■\n카메라", "■\n설정")
+        val tabNames = listOf("■\n탐지", "■\n카메라", "■\n라디오", "■\n설정")
 
         val tabRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -277,6 +303,8 @@ class MainActivity : Activity(), SensorEventListener {
         logPreferences = getSharedPreferences("phantom_scope_logs", MODE_PRIVATE)
         soundPreferences = getSharedPreferences("phantom_scope_sound_events", MODE_PRIVATE)
         settingsPreferences = getSharedPreferences("phantom_scope_settings", MODE_PRIVATE)
+        radioDirectionForward = settingsPreferences?.getBoolean("radio_forward", true) ?: true
+        radioSweepMs = settingsPreferences?.getInt("radio_sweep_ms", 900)?.coerceIn(200, 5000) ?: 900
         try { detectionTone = ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 85) } catch (_: Exception) { detectionTone = null }
         val savedSensitivity = settingsPreferences?.getInt("emf_sensitivity_percent", -1) ?: -1
         anomalyTriggerThreshold = if (savedSensitivity >= 0) {
@@ -326,6 +354,7 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     override fun onPause() {
+        stopInternetRadio(releasePlayers = true)
         stopAudioMonitoring()
         if (screenRecording) stopScreenRecording()
         // The system screen-capture consent dialog briefly pauses the Activity.
@@ -365,14 +394,29 @@ class MainActivity : Activity(), SensorEventListener {
 
         updateStatistics()
 
-        // 자동 기준 측정은 하지 않습니다. 감지 판정은 고정 시작점 20 μT 기준입니다.
+        // 기존 탐지 시각화 및 조사 기록용 기준값입니다. 음성 판정은 별도의 주변 기준값을 사용합니다.
         val deviation = abs(magnitude - 20f)
         if (::radarView.isInitialized) {
             radarView.updateData(deviation, x, y)
         }
+        // 첫 30개 센서 샘플로 현재 장소의 자기장 기준값을 잡습니다.
+        // 기준값이 준비되기 전에는 음성 감지를 하지 않습니다.
+        if (!voiceBaselineReady) {
+            voiceBaselineTotal += magnitude
+            voiceBaselineSamples++
+            if (voiceBaselineSamples >= 30) {
+                voiceBaseline = voiceBaselineTotal / voiceBaselineSamples
+                voiceBaselineReady = true
+            }
+        }
+
         if (detectionRunning) {
+            // 기존 조사 기록 판정은 유지하고, 음성 출력은 기준값 대비 실제 변화량으로 별도 판정합니다.
             handleAnomaly(deviation, magnitude)
-            maybeShowGhostWord(deviation)
+            if (voiceBaselineReady) maybeShowGhostWord(abs(magnitude - voiceBaseline))
+        } else if (voiceBaselineReady) {
+            // 탐지 대기 중에도 기준값을 아주 천천히 보정해 장소 변화에 적응시킵니다.
+            voiceBaseline += (magnitude - voiceBaseline) * 0.01f
         }
     }
 
@@ -413,6 +457,7 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun showPage(index: Int) {
+        if (index != 2) stopInternetRadio(releasePlayers = true)
         if (index != 1) {
             cameraPageVisible = false
             cameraGhostWordText = null
@@ -441,7 +486,8 @@ class MainActivity : Activity(), SensorEventListener {
         when (index) {
             0 -> showRadarPage()
             1 -> showCameraPage()
-            2 -> showSettingsPage()
+            2 -> showRadioPage()
+            3 -> showSettingsPage()
         }
     }
 
@@ -1907,7 +1953,7 @@ class MainActivity : Activity(), SensorEventListener {
                 investigationRecords.clear()
                 anomalyActive = false
                 saveInvestigationRecords()
-                showPage(2)
+                showPage(3)
             }
         }
         summary.addView(clear, LinearLayout.LayoutParams(-1, dp(42)).apply {
@@ -1993,7 +2039,7 @@ class MainActivity : Activity(), SensorEventListener {
                     if (actualIndex in investigationRecords.indices) {
                         investigationRecords.removeAt(actualIndex)
                         saveInvestigationRecords()
-                        showPage(2)
+                        showPage(3)
                     }
                 }
             }
@@ -2039,15 +2085,40 @@ class MainActivity : Activity(), SensorEventListener {
             setMargins(0, 0, 0, dp(12))
         })
 
+        val logHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(3), dp(4), dp(3), dp(7))
+        }
         val logTitle = TextView(this).apply {
             text = "DETECTION HISTORY"
             textSize = 11f
             letterSpacing = 1.2f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(accentColor)
-            setPadding(dp(3), dp(4), dp(3), dp(7))
         }
-        content.addView(logTitle)
+        logHeader.addView(logTitle, LinearLayout.LayoutParams(0, -2, 1f))
+        val clearVoiceLogsButton = Button(this).apply {
+            text = "기록 제거"
+            textSize = 10f
+            minHeight = dp(32)
+            minimumHeight = dp(32)
+            isAllCaps = false
+            setPadding(dp(10), 0, dp(10), 0)
+            setTextColor(Color.rgb(255, 165, 165))
+            background = roundedBackground(Color.argb(45, 125, 20, 25), 8)
+            setOnClickListener {
+                if (ghostWordLogs.isEmpty()) return@setOnClickListener
+                android.app.AlertDialog.Builder(this@MainActivity)
+                    .setTitle("음성 기록 제거")
+                    .setMessage("저장된 EMF 음성 기록을 모두 삭제할까요?")
+                    .setNegativeButton("취소", null)
+                    .setPositiveButton("삭제") { _, _ -> clearGhostWordLogs() }
+                    .show()
+            }
+        }
+        logHeader.addView(clearVoiceLogsButton)
+        content.addView(logHeader)
         ghostLogContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = neonPanelBackground()
@@ -2103,6 +2174,12 @@ class MainActivity : Activity(), SensorEventListener {
             })
         }
         ghostLogPreferences?.edit()?.putString("word_logs", array.toString())?.apply()
+        renderGhostWordLogs()
+    }
+
+    private fun clearGhostWordLogs() {
+        ghostWordLogs.clear()
+        ghostLogPreferences?.edit()?.remove("word_logs")?.apply()
         renderGhostWordLogs()
     }
 
@@ -2179,50 +2256,69 @@ class MainActivity : Activity(), SensorEventListener {
     private fun Float.formatOne(): String = String.format(Locale.US, "%.1f", this)
 
     private fun maybeShowGhostWord(deviation: Float) {
-        val now = System.currentTimeMillis()
-        if (deviation < anomalyTriggerThreshold) {
-            if (deviation < anomalyTriggerThreshold * anomalyResetRatio) ghostWordArmed = true
+        val sensitivityPercent = (settingsPreferences?.getInt("emf_sensitivity_percent", 49) ?: 49)
+            .coerceIn(0, 99)
+        val sensitivity = sensitivityPercent / 99f
+
+        // 민감도 53%일 때 약 9.5μT 이상의 기준값 이탈이 있어야 음성 후보가 됩니다.
+        // 낮은 민감도는 더 큰 변화가 필요하고, 높은 민감도는 조금 더 작은 변화를 허용합니다.
+        val voiceTriggerThreshold = 14f - (sensitivity * 8.5f)
+        val rearmThreshold = voiceTriggerThreshold * 0.55f
+
+        // 작은 흔들림은 무시하고, 자기장이 충분히 안정된 뒤에만 다음 이벤트를 허용합니다.
+        if (deviation < rearmThreshold) {
+            ghostWordArmed = true
+            // 정상 상태에서는 주변 환경 변화에 기준값을 천천히 맞춥니다.
+            voiceBaseline += (currentValue - voiceBaseline) * 0.015f
             return
         }
-        val sensitivity = (settingsPreferences?.getInt("emf_sensitivity_percent", 49) ?: 49) / 99f
-        val cooldown = (6500L - (sensitivity * 4200L)).toLong().coerceAtLeast(1800L)
-        // 자기장 변화가 계속 유지되어도 쿨다운이 지나면 다시 확률 판정을 합니다.
-        // 이전 구현처럼 기준값 아래로 완전히 내려가야만 재무장되는 문제를 제거합니다.
-        if (now - lastGhostWordTime < cooldown) return
+        if (deviation < voiceTriggerThreshold) return
 
-        // 민감도가 높을수록 단어 출력 확률이 커지고 재판정 대기시간은 짧아집니다.
-        val probability = (0.18f + sensitivity * 0.55f + ((deviation - anomalyTriggerThreshold) / 35f))
-            .coerceIn(0.18f, 0.90f)
-        // 한 번의 감지 구간에서는 확률 판정을 한 번만 수행합니다.
-        lastGhostWordTime = now
-        if (Math.random().toFloat() < probability) {
-            val words = ghostWordsForLanguage(selectedLanguage)
-            val previous = ghostWordText?.text?.toString()
-            val candidates = words.filter { it != previous }
-            val chosen = (candidates.ifEmpty { words }).random()
-            saveGhostWordLog(chosen, currentValue, deviation)
-            runOnUiThread {
-                // 단어가 실제로 출력될 때 짧고 강한 '뜨든' 감지음을 재생합니다.
-                try { detectionTone?.startTone(ToneGenerator.TONE_PROP_ACK, 210) } catch (_: Exception) { }
-                val wordColor = when {
-                    deviation >= 18f -> Color.rgb(255, 90, 110)
-                    deviation >= 10f -> Color.rgb(255, 170, 75)
-                    else -> accentColor
-                }
-                listOfNotNull(ghostWordText?.takeIf { it.isAttachedToWindow }, cameraGhostWordText?.takeIf { it.isAttachedToWindow }).forEach { wordView ->
-                    wordView.apply {
-                        text = chosen
-                        setTextColor(wordColor)
-                        visibility = View.VISIBLE
-                        // 녹화 중 Surface/Window 재구성으로 인한 충돌을 피하기 위해
-                        // 자막 갱신 시 View 애니메이션을 사용하지 않습니다.
-                        animate().cancel()
-                        scaleX = 1f
-                        scaleY = 1f
-                    }
-                }
-                speakGhostWord(chosen)
+        // 한 번의 자기장 상승 구간에서는 한 번만 확률 판정을 합니다.
+        if (!ghostWordArmed) return
+        if (System.currentTimeMillis() - lastGhostWordTime < ghostWordCooldownMs) return
+        ghostWordArmed = false
+
+        // 음성 출력 후 시간 대기(쿨다운)는 두지 않습니다.
+        // 대신 자기장이 안정 구간으로 복귀해야 다음 이벤트가 재무장되며,
+        // 이벤트당 확률을 낮춰 연속 발화를 억제합니다.
+        // 민감도 53%에서 임계값 직후 약 7~8%, 큰 변화에서도 최대 25%입니다.
+        val strength = ((deviation / voiceTriggerThreshold) - 1f).coerceIn(0f, 2f) / 2f
+        val probability = (0.025f + sensitivity * 0.10f + strength * 0.15f)
+            .coerceIn(0.03f, 0.25f)
+        if (Math.random().toFloat() >= probability) return
+
+        val words = ghostWordsForLanguage(selectedLanguage)
+        // 직전에 말한 단어뿐 아니라 최근 5개 단어도 후보에서 제외해 반복감을 줄입니다.
+        val candidates = words.filter { it !in recentGhostWords }
+        val chosen = (candidates.ifEmpty { words.filter { it != recentGhostWords.lastOrNull() }.ifEmpty { words } }).random()
+        recentGhostWords.addLast(chosen)
+        while (recentGhostWords.size > 5) recentGhostWords.removeFirst()
+        lastGhostWordTime = System.currentTimeMillis()
+        saveGhostWordLog(chosen, currentValue, deviation)
+
+        runOnUiThread {
+            // 단어가 실제로 출력될 때만 짧은 감지음을 재생합니다.
+            try { detectionTone?.startTone(ToneGenerator.TONE_PROP_ACK, 210) } catch (_: Exception) { }
+            val wordColor = when {
+                deviation >= voiceTriggerThreshold * 2.5f -> Color.rgb(255, 90, 110)
+                deviation >= voiceTriggerThreshold * 1.7f -> Color.rgb(255, 170, 75)
+                else -> accentColor
             }
+            listOfNotNull(
+                ghostWordText?.takeIf { it.isAttachedToWindow },
+                cameraGhostWordText?.takeIf { it.isAttachedToWindow }
+            ).forEach { wordView ->
+                wordView.apply {
+                    text = chosen
+                    setTextColor(wordColor)
+                    visibility = View.VISIBLE
+                    animate().cancel()
+                    scaleX = 1f
+                    scaleY = 1f
+                }
+            }
+            speakGhostWord(chosen)
         }
     }
 
@@ -2405,7 +2501,7 @@ class MainActivity : Activity(), SensorEventListener {
             .setTitle("PREMIUM 기능")
             .setMessage("${feature} 기능은 현재 사용할 수 없습니다.")
             .setNegativeButton("나중에", null)
-            .setPositiveButton("설정 열기") { _, _ -> showPage(2) }
+            .setPositiveButton("설정 열기") { _, _ -> showPage(3) }
             .show()
     }
 
@@ -2432,6 +2528,368 @@ class MainActivity : Activity(), SensorEventListener {
             }
         }
         return result.distinct().take(1000)
+    }
+
+    private fun showRadioPage() {
+        addHeading("INTERNET RADIO SWEEP")
+        addPanelText(
+            "SPIRIT BOX · 인터넷 라디오 스윕",
+            "전 세계 인터넷 라디오 방송을 최대 1,000개까지 검색합니다. 메모리와 연결 안정성을 위해 한 번에 8개 스트림만 준비하고, 채널 묶음을 순환하며 스캔합니다. 실제 RF 주파수 튜닝이 아닌 인터넷 방송 전환 방식입니다."
+        )
+
+        val statusPanel = makePanel()
+        val statusTitle = TextView(this).apply {
+            text = "CONNECTION STATUS"
+            textSize = 12f
+            letterSpacing = 0.22f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(accentColor)
+        }
+        radioStatusView = TextView(this).apply {
+            text = "대기 중 · 방송 목록을 불러오려면 새로고침을 누르세요"
+            textSize = 13f
+            setTextColor(Color.WHITE)
+            setPadding(0, dp(8), 0, dp(2))
+        }
+        radioCurrentStationView = TextView(this).apply {
+            text = "CURRENT CHANNEL  —"
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(accentColor)
+            setPadding(0, dp(7), 0, 0)
+        }
+        statusPanel.addView(statusTitle)
+        statusPanel.addView(radioStatusView)
+        statusPanel.addView(radioCurrentStationView)
+        content.addView(statusPanel, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(0, 0, 0, dp(12))
+        })
+
+        val speedPanel = makePanel()
+        val speedHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val speedTitle = TextView(this).apply {
+            text = "스윕 전환 간격"
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        }
+        val speedValue = TextView(this).apply {
+            text = "${radioSweepMs} ms / 채널"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(accentColor)
+        }
+        speedHeader.addView(speedTitle, LinearLayout.LayoutParams(0, -2, 1f))
+        speedHeader.addView(speedValue)
+        speedPanel.addView(speedHeader)
+        val speedSeek = SeekBar(this).apply {
+            max = 4800
+            progress = radioSweepMs - 200
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    radioSweepMs = progress + 200
+                    speedValue.text = "${radioSweepMs} ms / 채널"
+                    if (fromUser) {
+                        settingsPreferences?.edit()?.putInt("radio_sweep_ms", radioSweepMs)?.apply()
+                        if (radioSweepRunning) scheduleNextRadioChannel()
+                    }
+                }
+                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+            })
+        }
+        speedPanel.addView(speedSeek)
+        speedPanel.addView(TextView(this).apply {
+            text = "200ms 빠른 전환  ·  900ms 기본  ·  5,000ms 느린 전환\n인터넷 스트림 버퍼 상태에 따라 짧은 구간은 음성이 잘릴 수 있습니다."
+            textSize = 10.5f
+            setTextColor(Color.rgb(145, 165, 150))
+        })
+        content.addView(speedPanel, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(0, 0, 0, dp(12))
+        })
+
+        val directionPanel = makePanel()
+        directionPanel.addView(TextView(this).apply {
+            text = "채널 순서"
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        })
+        val directionButton = Button(this).apply {
+            text = if (radioDirectionForward) "정방향  →" else "←  역방향"
+            isAllCaps = false
+            setTextColor(accentColor)
+            background = roundedBackground(Color.rgb(8, 28, 16), 9)
+            setOnClickListener {
+                radioDirectionForward = !radioDirectionForward
+                settingsPreferences?.edit()?.putBoolean("radio_forward", radioDirectionForward)?.apply()
+                text = if (radioDirectionForward) "정방향  →" else "←  역방향"
+            }
+        }
+        directionPanel.addView(directionButton, LinearLayout.LayoutParams(-1, dp(44)).apply {
+            setMargins(0, dp(8), 0, 0)
+        })
+        content.addView(directionPanel, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(0, 0, 0, dp(12))
+        })
+
+        val controlPanel = makePanel()
+        val controlRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        radioStartButton = Button(this).apply {
+            text = "라디오 불러오기 / 시작"
+            isAllCaps = false
+            setTextColor(Color.BLACK)
+            background = roundedBackground(accentColor, 10)
+            setOnClickListener { loadInternetRadioStations() }
+        }
+        radioStopButton = Button(this).apply {
+            text = "정지"
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            background = roundedBackground(Color.rgb(55, 25, 25), 10)
+            setOnClickListener { stopInternetRadio(releasePlayers = true) }
+        }
+        controlRow.addView(radioStartButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply {
+            setMargins(0, 0, dp(5), 0)
+        })
+        controlRow.addView(radioStopButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply {
+            setMargins(dp(5), 0, 0, 0)
+        })
+        controlPanel.addView(controlRow)
+        radioStationListView = TextView(this).apply {
+            text = "방송 목록이 아직 로드되지 않았습니다.\n인터넷 연결 후 시작 버튼을 눌러주세요."
+            textSize = 11.5f
+            setTextColor(Color.LTGRAY)
+            setPadding(0, dp(10), 0, 0)
+        }
+        controlPanel.addView(radioStationListView)
+        content.addView(controlPanel, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(0, 0, 0, dp(12))
+        })
+
+        addPanelText(
+            "수신 방식 및 한계",
+            "전 세계 언어·국가·음악 장르·토크·뉴스 방송을 혼합 검색합니다. 목록은 최대 1,000개이며, 실제 재생 가능한 방송은 네트워크와 방송국 상태에 따라 달라집니다. 엔터테인먼트용 오디오 스캔으로 초자연 현상이나 음성의 출처를 검증하지 않습니다."
+        )
+    }
+
+    private fun loadInternetRadioStations() {
+        if (radioLoading) return
+        stopInternetRadio(releasePlayers = true)
+        radioLoading = true
+        radioStatusView?.text = "전 세계 인터넷 방송 검색 중…"
+        radioStartButton?.isEnabled = false
+        Thread {
+            // 다양한 국가·언어·음악/토크 장르를 섞어 최대 1,000개까지 확보합니다.
+            val queries = listOf(
+                "hidebroken=true&is_https=true&order=random&limit=1000",
+                "tag=music&hidebroken=true&is_https=true&order=random&limit=300",
+                "tag=pop&hidebroken=true&is_https=true&order=random&limit=200",
+                "tag=rock&hidebroken=true&is_https=true&order=random&limit=150",
+                "tag=talk&hidebroken=true&is_https=true&order=random&limit=150",
+                "tag=news&hidebroken=true&is_https=true&order=random&limit=150"
+            )
+            val merged = LinkedHashMap<String, RadioStation>()
+            for (query in queries) {
+                if (merged.size >= 1000) break
+                fetchRadioStations(query, (1000 - merged.size).coerceAtMost(1000)).forEach { station ->
+                    if (station.streamUrl.isNotBlank()) merged.putIfAbsent(station.streamUrl, station)
+                }
+            }
+            val stations = merged.values.toList().take(1000)
+            runOnUiThread {
+                radioLoading = false
+                radioStartButton?.isEnabled = true
+                if (stations.isEmpty()) {
+                    radioStatusView?.text = "방송 목록을 가져오지 못했습니다. 인터넷 연결을 확인하고 다시 시도하세요."
+                    return@runOnUiThread
+                }
+                radioStations.clear()
+                radioStations.addAll(stations)
+                radioBatchStart = 0
+                radioBatchSwitchCount = 0
+                radioStationListView?.text = radioStations.take(30).mapIndexed { i, station ->
+                    "${i + 1}. ${station.name}"
+                }.joinToString("\n") + if (radioStations.size > 30) "\n… 외 ${radioStations.size - 30}개 방송" else ""
+                radioStatusView?.text = "${radioStations.size}개 글로벌 방송 확보 · 첫 8개 채널 연결 중…"
+                prepareRadioPlayers()
+            }
+        }.start()
+    }
+
+    private fun fetchRadioStations(filters: String, maxResults: Int): List<RadioStation> {
+        var connection: HttpURLConnection? = null
+        return try {
+            val cleanFilters = filters.replace(Regex("&?limit=\\d+"), "")
+            val endpoint = "https://de1.api.radio-browser.info/json/stations/search?$cleanFilters&limit=${maxResults.coerceIn(1, 1000)}"
+            connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 10000
+                readTimeout = 15000
+                setRequestProperty("User-Agent", "PHANTOM-SCOPE/1.1 Android")
+                setRequestProperty("Accept", "application/json")
+            }
+            if (connection.responseCode !in 200..299) return emptyList()
+            val body = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val array = JSONArray(body)
+            val result = mutableListOf<RadioStation>()
+            for (i in 0 until array.length()) {
+                val item = array.optJSONObject(i) ?: continue
+                val stream = item.optString("url_resolved").ifBlank { item.optString("url") }
+                if (!stream.startsWith("https://", true)) continue
+                val name = item.optString("name").trim().ifBlank { "UNKNOWN STATION" }
+                result.add(RadioStation(name, stream, item.optString("stationuuid")))
+            }
+            result
+        } catch (e: Exception) {
+            android.util.Log.w("PhantomRadio", "Station directory request failed", e)
+            emptyList()
+        } finally {
+            connection?.disconnect()
+        }
+    }
+
+    private fun prepareRadioPlayers() {
+        releaseRadioPlayers()
+        if (radioStations.isEmpty()) return
+        radioReadyIndexes.clear()
+        radioAttemptedIndexes.clear()
+        val batchEnd = (radioBatchStart + radioBatchSize).coerceAtMost(radioStations.size)
+        val batch = radioStations.subList(radioBatchStart, batchEnd).toList()
+        radioStatusView?.text = "전체 ${radioStations.size}개 중 ${radioBatchStart + 1}~$batchEnd번 방송 연결 중…"
+        batch.forEachIndexed { localIndex, station ->
+            val player = MediaPlayer()
+            radioPlayers.add(player)
+            try {
+                player.setAudioStreamType(android.media.AudioManager.STREAM_MUSIC)
+                player.setVolume(0f, 0f)
+                player.setDataSource(station.streamUrl)
+                player.setOnPreparedListener { prepared ->
+                    try {
+                        prepared.setVolume(0f, 0f)
+                        prepared.start()
+                        radioAttemptedIndexes.add(localIndex)
+                        radioReadyIndexes.add(localIndex)
+                        maybeStartRadioSweepWhenReady()
+                    } catch (e: Exception) {
+                        radioAttemptedIndexes.add(localIndex)
+                        android.util.Log.w("PhantomRadio", "Could not start stream ${station.name}", e)
+                        maybeStartRadioSweepWhenReady()
+                    }
+                }
+                player.setOnErrorListener { _, what, extra ->
+                    android.util.Log.w("PhantomRadio", "Stream error ${station.name}: $what/$extra")
+                    radioAttemptedIndexes.add(localIndex)
+                    radioReadyIndexes.remove(localIndex)
+                    maybeStartRadioSweepWhenReady()
+                    true
+                }
+                player.prepareAsync()
+            } catch (e: Exception) {
+                radioAttemptedIndexes.add(localIndex)
+                android.util.Log.w("PhantomRadio", "Stream preparation failed: ${station.name}", e)
+                maybeStartRadioSweepWhenReady()
+            }
+        }
+    }
+
+    private fun maybeStartRadioSweepWhenReady() {
+        val batchCount = radioPlayers.size
+        radioStatusView?.text = "전체 ${radioStations.size}개 방송 · 현재 묶음 연결 ${radioReadyIndexes.size}/$batchCount"
+        if (radioAttemptedIndexes.size < batchCount || radioSweepRunning) return
+        if (radioReadyIndexes.isEmpty()) {
+            radioStatusView?.text = "연결 가능한 방송이 없습니다. 새로고침을 시도하세요."
+            return
+        }
+        radioStatusView?.text = "${radioReadyIndexes.size}개 채널 연결 완료 · 전체 ${radioStations.size}개 중 ${radioBatchStart + 1}~${(radioBatchStart + radioPlayers.size).coerceAtMost(radioStations.size)}번 스캔"
+        radioBatchSwitchCount = 0
+        radioSweepRunning = true
+        radioCurrentIndex = if (radioDirectionForward) -1 else 0
+        switchRadioChannel()
+    }
+
+    private fun switchRadioChannel() {
+        if (!radioSweepRunning || radioReadyIndexes.isEmpty()) return
+        val count = radioPlayers.size
+        var next = radioCurrentIndex
+        var found = false
+        var checked = 0
+        while (checked < count) {
+            next = if (radioDirectionForward) (next + 1) % count else (next - 1 + count) % count
+            if (radioReadyIndexes.contains(next)) {
+                found = true
+                break
+            }
+            checked++
+        }
+        if (!found) {
+            radioStatusView?.text = "재생 가능한 방송이 없습니다. 다시 불러와 주세요."
+            stopInternetRadio(releasePlayers = true)
+            return
+        }
+        radioPlayers.forEachIndexed { index, player ->
+            try { player.setVolume(if (index == next) 1f else 0f, if (index == next) 1f else 0f) }
+            catch (_: Exception) { }
+        }
+        radioCurrentIndex = next
+        val globalIndex = radioBatchStart + next
+        radioCurrentStationView?.text = "CURRENT CHANNEL  ${globalIndex + 1}/${radioStations.size} · ${radioStations.getOrNull(globalIndex)?.name ?: "—"}"
+        radioBatchSwitchCount++
+        if (radioBatchSwitchCount >= radioReadyIndexes.size && radioStations.size > radioBatchSize) {
+            scheduleNextRadioBatch()
+        } else {
+            scheduleNextRadioChannel()
+        }
+    }
+
+    private fun scheduleNextRadioBatch() {
+        radioHandler.removeCallbacks(radioSweepRunnable)
+        if (!radioSweepRunning) return
+        radioHandler.postDelayed({
+            if (!radioSweepRunning) return@postDelayed
+            radioSweepRunning = false
+            radioBatchStart = (radioBatchStart + radioBatchSize) % radioStations.size
+            radioBatchSwitchCount = 0
+            radioCurrentIndex = -1
+            prepareRadioPlayers()
+        }, radioSweepMs.toLong())
+    }
+
+    private fun scheduleNextRadioChannel() {
+        radioHandler.removeCallbacks(radioSweepRunnable)
+        if (radioSweepRunning) radioHandler.postDelayed(radioSweepRunnable, radioSweepMs.toLong())
+    }
+
+    private val radioSweepRunnable = object : Runnable {
+        override fun run() {
+            if (radioSweepRunning) switchRadioChannel()
+        }
+    }
+
+    private fun stopInternetRadio(releasePlayers: Boolean) {
+        radioSweepRunning = false
+        radioHandler.removeCallbacks(radioSweepRunnable)
+        radioPlayers.forEach { player ->
+            try { player.setVolume(0f, 0f) } catch (_: Exception) { }
+        }
+        if (releasePlayers) {
+            releaseRadioPlayers()
+            radioStatusView?.text = if (radioStations.isEmpty()) "대기 중" else "정지됨 · ${radioStations.size}개 방송 목록 유지"
+            radioCurrentStationView?.text = "CURRENT CHANNEL  —"
+        }
+    }
+
+    private fun releaseRadioPlayers() {
+        radioPlayers.forEach { player ->
+            try { player.setOnPreparedListener(null); player.setOnErrorListener(null); player.stop() } catch (_: Exception) { }
+            try { player.reset(); player.release() } catch (_: Exception) { }
+        }
+        radioPlayers.clear()
+        radioReadyIndexes.clear()
+        radioAttemptedIndexes.clear()
     }
 
     private fun showSettingsPage() {
@@ -2538,9 +2996,23 @@ class MainActivity : Activity(), SensorEventListener {
             })
         }
         sensitivityPanel.addView(sensitivitySeek)
+        val sensitivityHint = TextView(this).apply {
+            text = "작은 자기장 흔들림은 무시하고, 주변 기준값에서 큰 변화가 감지될 때만 낮은 확률로 음성이 출력됩니다."
+            textSize = 10.5f
+            setTextColor(Color.rgb(145, 165, 150))
+            setPadding(0, dp(5), 0, 0)
+        }
+        sensitivityPanel.addView(sensitivityHint)
         content.addView(sensitivityPanel, LinearLayout.LayoutParams(-1, -2).apply {
             setMargins(0, 0, 0, dp(12))
         })
+
+        addHeading("EQUIPMENT GUIDE")
+        addPanelText("EMF METER · 자기장 측정기", "주변 자기장 세기를 μT 단위로 측정합니다. 전기 배선, 모터, 스피커, 자석 등도 수치에 영향을 줍니다.")
+        addPanelText("CAMERA · 영상 관측", "카메라 영상에서 인체 형태와 움직임을 분석합니다. 저조도·가림·카메라 흔들림은 오탐 또는 미탐의 원인이 될 수 있습니다.")
+        addPanelText("AUDIO / EVP · 음향 기록", "마이크로 주변 소리를 수집하고 녹음합니다. 잡음 속 음성처럼 들리는 구간은 원본 녹음으로 재확인해야 합니다.")
+        addPanelText("RADIO SWEEP · 인터넷 방송 스캔", "여러 인터넷 라디오 스트림을 미리 연결하고 짧은 간격으로 재생 채널을 전환합니다. 실제 RF 주파수 튜닝과는 다른 방식입니다.")
+        addPanelText("DETECTION LOG · 조사 기록", "감지 시각, 자기장 변화량, 출력된 단어 및 저장된 증거 파일을 확인합니다. 기록은 앱 내부 저장소에 보관됩니다.")
 
     }
 
@@ -2698,7 +3170,7 @@ class MainActivity : Activity(), SensorEventListener {
     private fun neonPanelBackground(): GradientDrawable {
         return GradientDrawable(
             GradientDrawable.Orientation.TOP_BOTTOM,
-            intArrayOf(Color.argb(172, 5, 22, 14), Color.argb(184, 2, 10, 8), Color.argb(172, 3, 15, 10))
+            intArrayOf(Color.argb(218, 5, 22, 14), Color.argb(224, 2, 10, 8), Color.argb(218, 3, 15, 10))
         ).apply {
             cornerRadius = dp(17).toFloat()
             setStroke(dp(1), Color.rgb(45, 155, 88))
@@ -2739,6 +3211,7 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     override fun onDestroy() {
+        stopInternetRadio(releasePlayers = true)
         try {
             ghostTts?.stop()
             ghostTts?.shutdown()
