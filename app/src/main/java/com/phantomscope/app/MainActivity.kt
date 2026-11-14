@@ -3587,3 +3587,301 @@ class RadarView(context: android.content.Context) : View(context) {
         return (value * resources.displayMetrics.density).toInt()
     }
 }
+
+class PoseOverlayView(context: Context) : View(context) {
+    private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(70, 255, 150); style = Paint.Style.STROKE; strokeWidth = 2.5f
+        pathEffect = android.graphics.DashPathEffect(floatArrayOf(5f, 7f), 0f)
+    }
+    private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(120, 255, 175); style = Paint.Style.FILL
+    }
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(120, 255, 175); textSize = 13f; typeface = Typeface.DEFAULT_BOLD
+    }
+    @Volatile private var poseData: Pose? = null
+    private var sourceWidth = 0
+    private var sourceHeight = 0
+    private var rotation = 0
+    private var front = false
+    fun setPose(pose: Pose, width: Int, height: Int, rotationDegrees: Int, isFront: Boolean) {
+        poseData = pose; sourceWidth = width; sourceHeight = height
+        rotation = rotationDegrees; front = isFront
+        postInvalidate()
+    }
+    fun clearPose() { poseData = null; postInvalidate() }
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val pose = poseData ?: return
+        if (pose.allPoseLandmarks.isEmpty() || sourceWidth == 0 || sourceHeight == 0) return
+        val rotated = rotation == 90 || rotation == 270
+        val imageW = if (rotated) sourceHeight.toFloat() else sourceWidth.toFloat()
+        val imageH = if (rotated) sourceWidth.toFloat() else sourceHeight.toFloat()
+        val scale = max(width / imageW, height / imageH)
+        val dx = (width - imageW * scale) / 2f
+        val dy = (height - imageH * scale) / 2f
+        val save = canvas.save()
+        if (front) {
+            canvas.scale(-1f, 1f, width / 2f, height / 2f)
+        }
+        fun point(type: Int): PointF? {
+            val landmark = pose.getPoseLandmark(type) ?: return null
+            return PointF(dx + landmark.position.x * scale, dy + landmark.position.y * scale)
+        }
+        val connections = arrayOf(
+            intArrayOf(11,12), intArrayOf(11,13), intArrayOf(13,15),
+            intArrayOf(12,14), intArrayOf(14,16), intArrayOf(11,23),
+            intArrayOf(12,24), intArrayOf(23,24), intArrayOf(23,25),
+            intArrayOf(25,27), intArrayOf(24,26), intArrayOf(26,28),
+            intArrayOf(27,29), intArrayOf(29,31), intArrayOf(28,30), intArrayOf(30,32)
+        )
+        connections.forEach { pair ->
+            val a = point(pair[0]); val b = point(pair[1])
+            if (a != null && b != null) canvas.drawLine(a.x, a.y, b.x, b.y, linePaint)
+        }
+        // Dotted body contour approximated from shoulder, elbow, wrist, hip, knee and ankle landmarks.
+        val contour = listOf(11,13,15,17,19,15,13,11,23,25,27,31,27,25,23,24,26,28,32,28,26,24,12,14,16,18,20,16,14,12)
+            .mapNotNull { point(it) }
+        if (contour.size > 2) {
+            val path = Path().apply {
+                moveTo(contour.first().x, contour.first().y)
+                contour.drop(1).forEach { lineTo(it.x, it.y) }
+                close()
+            }
+            canvas.drawPath(path, linePaint)
+        }
+        pose.allPoseLandmarks.forEach { landmark ->
+            val p = point(landmark.landmarkType)
+            if (p != null) canvas.drawCircle(p.x, p.y, 3.8f, dotPaint)
+        }
+        canvas.drawText("HUMAN TRACKING", dp(10f), dp(20f), textPaint)
+        canvas.restoreToCount(save)
+    }
+    private fun dp(v: Float) = v * resources.displayMetrics.density
+}
+
+
+/**
+ * Records the visible camera screen through MediaProjection. Because the pose overlay is
+ * part of the same screen composition as the preview, the saved MP4 includes the skeleton.
+ */
+class PhantomScreenRecordingService : Service() {
+    companion object {
+        const val ACTION_START = "com.phantomscope.app.action.START_SCREEN_RECORDING"
+        const val ACTION_STOP = "com.phantomscope.app.action.STOP_SCREEN_RECORDING"
+        const val EXTRA_RESULT_CODE = "projection_result_code"
+        const val EXTRA_RESULT_DATA = "projection_result_data"
+        private const val CHANNEL_ID = "phantom_recording"
+        private const val NOTIFICATION_ID = 1901
+    }
+
+    private var projection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var recorder: MediaRecorder? = null
+    private var outputUri: Uri? = null
+    private var outputFile: File? = null
+    private var outputDescriptor: ParcelFileDescriptor? = null
+    private var recordingStarted = false
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_STOP -> {
+                finishRecording()
+                return START_NOT_STICKY
+            }
+            ACTION_START -> {
+                try {
+                    createNotificationChannel()
+                    val notification = buildNotification()
+                    if (android.os.Build.VERSION.SDK_INT >= 29) {
+                        startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                    } else {
+                        startForeground(NOTIFICATION_ID, notification)
+                    }
+                    val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+                    val resultData = if (android.os.Build.VERSION.SDK_INT >= 33) {
+                        intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(EXTRA_RESULT_DATA) as? Intent
+                    } ?: throw IllegalStateException("화면 녹화 권한 데이터가 없습니다.")
+                    startRecording(resultCode, resultData)
+                } catch (e: Exception) {
+                    android.util.Log.e("PhantomRecorder", "Recording start failed", e)
+                    finishRecording()
+                }
+            }
+        }
+        return START_NOT_STICKY
+    }
+
+    private fun createNotificationChannel() {
+        if (android.os.Build.VERSION.SDK_INT >= 26) {
+            val channel = NotificationChannel(CHANNEL_ID, "PHANTOM SCOPE 녹화", NotificationManager.IMPORTANCE_LOW)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        }
+    }
+
+    private fun buildNotification(): Notification {
+        val stopIntent = Intent(this, PhantomScreenRecordingService::class.java).apply { action = ACTION_STOP }
+        val pending = PendingIntent.getService(
+            this, 1902, stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val builder = if (android.os.Build.VERSION.SDK_INT >= 26) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+        return builder
+            .setContentTitle("PHANTOM SCOPE 녹화 중")
+            .setContentText("모션캡쳐 오버레이를 포함해 화면을 녹화하고 있습니다.")
+            .setSmallIcon(android.R.drawable.presence_video_online)
+            .setOngoing(true)
+            .addAction(Notification.Action.Builder(android.R.drawable.ic_media_pause, "녹화 종료", pending).build())
+            .build()
+    }
+
+    private fun startRecording(resultCode: Int, resultData: Intent) {
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        (getSystemService(WINDOW_SERVICE) as android.view.WindowManager).defaultDisplay.getRealMetrics(metrics)
+        val scale = min(1f, 1920f / max(metrics.widthPixels, metrics.heightPixels).toFloat())
+        val width = max(2, ((metrics.widthPixels * scale).toInt() / 2) * 2)
+        val height = max(2, ((metrics.heightPixels * scale).toInt() / 2) * 2)
+        val density = metrics.densityDpi
+
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val displayName = "PHANTOM_VIDEO_$stamp.mp4"
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/PHANTOM SCOPE")
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+            }
+            outputUri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                ?: throw java.io.IOException("동영상 저장 위치를 만들 수 없습니다.")
+            val descriptor = contentResolver.openFileDescriptor(outputUri!!, "w")
+                ?: throw java.io.IOException("동영상 파일을 열 수 없습니다.")
+            outputDescriptor = descriptor
+            recorder = if (android.os.Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else {
+                @Suppress("DEPRECATION")
+                MediaRecorder()
+            }
+            recorder!!.apply {
+                setVideoSource(MediaRecorder.VideoSource.SURFACE)
+                setAudioSource(MediaRecorder.AudioSource.MIC)
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setAudioChannels(1)
+                setAudioSamplingRate(44100)
+                setAudioEncodingBitRate(128000)
+                setVideoSize(width, height)
+                setVideoFrameRate(30)
+                setVideoEncodingBitRate(6_000_000)
+                setOutputFile(descriptor.fileDescriptor)
+                prepare()
+            }
+            val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            projection = manager.getMediaProjection(resultCode, resultData)
+            projection!!.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() { finishRecording() }
+            }, android.os.Handler(mainLooper))
+            val surface = recorder!!.surface
+            virtualDisplay = projection!!.createVirtualDisplay(
+                "PHANTOM_SCOPE_CAPTURE", width, height, density,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                surface, null, null
+            )
+            recorder!!.start()
+            recordingStarted = true
+        } else {
+            val folder = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "PhantomScope")
+            if (!folder.exists()) folder.mkdirs()
+            outputFile = File(folder, displayName)
+            recorder = if (android.os.Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else {
+                @Suppress("DEPRECATION")
+                MediaRecorder()
+            }
+            recorder!!.apply {
+                setVideoSource(MediaRecorder.VideoSource.SURFACE)
+                setAudioSource(MediaRecorder.AudioSource.MIC)
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setAudioChannels(1)
+                setAudioSamplingRate(44100)
+                setAudioEncodingBitRate(128000)
+                setVideoSize(width, height)
+                setVideoFrameRate(30)
+                setVideoEncodingBitRate(6_000_000)
+                setOutputFile(outputFile!!.absolutePath)
+                prepare()
+            }
+            val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            projection = manager.getMediaProjection(resultCode, resultData)
+            projection!!.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() { finishRecording() }
+            }, android.os.Handler(mainLooper))
+            virtualDisplay = projection!!.createVirtualDisplay(
+                "PHANTOM_SCOPE_CAPTURE", width, height, density,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                recorder!!.surface, null, null
+            )
+            recorder!!.start()
+            recordingStarted = true
+        }
+    }
+
+    private fun finishRecording() {
+        try {
+            virtualDisplay?.release()
+            virtualDisplay = null
+            if (recordingStarted) {
+                try { recorder?.stop() } catch (_: RuntimeException) { }
+            }
+            recordingStarted = false
+            try { recorder?.reset() } catch (_: Exception) { }
+            try { recorder?.release() } catch (_: Exception) { }
+            recorder = null
+            try { outputDescriptor?.close() } catch (_: Exception) { }
+            outputDescriptor = null
+            try { projection?.stop() } catch (_: Exception) { }
+            projection = null
+
+            outputUri?.let { uri ->
+                val values = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+                contentResolver.update(uri, values, null, null)
+                outputUri = null
+            }
+            outputFile?.let {
+                if (it.exists()) {
+                    val values = ContentValues().apply {
+                        put(MediaStore.Video.Media.DISPLAY_NAME, it.name)
+                        put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                        put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/PHANTOM SCOPE")
+                    }
+                    contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)?.let { uri ->
+                        contentResolver.openOutputStream(uri)?.use { out -> it.inputStream().use { input -> input.copyTo(out) } }
+                    }
+                }
+                outputFile = null
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("PhantomRecorder", "Recording finish failed", e)
+        } finally {
+            stopForeground(true)
+            stopSelf()
+        }
+    }
+
+    override fun onDestroy() {
+        if (recordingStarted || projection != null) finishRecording()
+        super.onDestroy()
+    }
+}
