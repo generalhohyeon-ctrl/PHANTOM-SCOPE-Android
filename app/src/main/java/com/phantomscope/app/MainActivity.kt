@@ -39,6 +39,7 @@ import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.view.ViewGroup
 import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.BitmapDrawable
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.pose.Pose
 import com.google.mlkit.vision.pose.PoseDetection
@@ -186,44 +187,16 @@ class MainActivity : Activity(), SensorEventListener {
         window.statusBarColor = backgroundColor
         window.navigationBarColor = backgroundColor
 
+        // 배경 이미지는 별도 리소스로 관리합니다. 이미지 상단의 PHANTOM SCOPE 로고를
+        // 그대로 노출하고, 실제 UI는 그 위에 투명 레이어로 표시합니다.
+        val backgroundBitmap = BitmapFactory.decodeResource(resources, R.drawable.phantom_background)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(backgroundColor)
-            setPadding(dp(12), dp(8), dp(12), dp(6))
+            background = BitmapDrawable(resources, backgroundBitmap).apply {
+                gravity = Gravity.FILL
+            }
+            setPadding(dp(12), dp(4), dp(12), dp(6))
         }
-
-        val header = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(0, dp(7), 0, dp(12))
-        }
-        val title = TextView(this).apply {
-            text = "PHANTOM SCOPE"
-            textSize = 27f
-            setTextColor(accentColor)
-            typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD_ITALIC)
-            setShadowLayer(dp(12).toFloat(), 0f, 0f, Color.rgb(20, 255, 70))
-            letterSpacing = 0.07f
-            gravity = Gravity.CENTER
-        }
-        val brandLine = TextView(this).apply {
-            text = "━━━━━━━━━━━━  ◉  ━━━━━━━━━━━━"
-            textSize = 9f
-            setTextColor(Color.rgb(40, 150, 75))
-            gravity = Gravity.CENTER
-            setPadding(0, dp(1), 0, dp(2))
-        }
-        val versionLabel = TextView(this).apply {
-            text = "PARANORMAL DETECTION SYSTEM"
-            textSize = 9f
-            letterSpacing = 1.8f
-            setTextColor(Color.rgb(100, 220, 130))
-            gravity = Gravity.CENTER
-        }
-        header.addView(title, LinearLayout.LayoutParams(-1, dp(42)))
-        header.addView(brandLine, LinearLayout.LayoutParams(-1, dp(12)))
-        header.addView(versionLabel, LinearLayout.LayoutParams(-1, dp(18)))
-        root.addView(header, LinearLayout.LayoutParams(-1, -2))
 
         val tabNames = listOf("■\n탐지", "■\n카메라", "■\n설정")
 
@@ -262,7 +235,9 @@ class MainActivity : Activity(), SensorEventListener {
 
         content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(2), dp(5), dp(2), dp(8))
+            // 이미지 안의 로고와 부딪히지 않도록 콘텐츠 시작 위치를 아래로 내립니다.
+            setPadding(dp(2), dp(142), dp(2), dp(12))
+            setBackgroundColor(Color.TRANSPARENT)
         }
 
         scrollView.addView(content)
@@ -2032,24 +2007,26 @@ class MainActivity : Activity(), SensorEventListener {
 
         val wordPanel = makePanel().apply {
             gravity = Gravity.CENTER
-            setPadding(dp(16), dp(18), dp(16), dp(18))
+            setPadding(dp(16), dp(24), dp(16), dp(24))
+            background = neonPanelBackground()
         }
         val wordCaption = TextView(this).apply {
             text = "DETECTED WORD"
-            textSize = 10f
-            letterSpacing = 1.4f
+            textSize = 11f
+            letterSpacing = 1.6f
             typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.GRAY)
+            setTextColor(Color.rgb(165, 190, 178))
             gravity = Gravity.CENTER
         }
         wordPanel.addView(wordCaption)
         ghostWordText = TextView(this).apply {
             text = "—"
-            textSize = 30f
-            typeface = Typeface.DEFAULT_BOLD
+            textSize = 34f
+            typeface = Typeface.create("sans-serif", Typeface.BOLD)
             setTextColor(accentColor)
+            setShadowLayer(dp(13).toFloat(), 0f, 0f, Color.rgb(35, 255, 100))
             gravity = Gravity.CENTER
-            setPadding(0, dp(12), 0, dp(4))
+            setPadding(0, dp(16), 0, dp(6))
         }
         wordPanel.addView(ghostWordText)
         content.addView(wordPanel, LinearLayout.LayoutParams(-1, -2).apply {
@@ -2067,8 +2044,8 @@ class MainActivity : Activity(), SensorEventListener {
         content.addView(logTitle)
         ghostLogContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = roundedBackground(panelColor, 14)
-            setPadding(dp(10), dp(8), dp(10), dp(8))
+            background = neonPanelBackground()
+            setPadding(dp(12), dp(10), dp(12), dp(10))
         }
         content.addView(ghostLogContainer, LinearLayout.LayoutParams(-1, -2).apply {
             setMargins(0, 0, 0, dp(12))
@@ -2078,12 +2055,13 @@ class MainActivity : Activity(), SensorEventListener {
         val spacer = View(this)
         content.addView(spacer, LinearLayout.LayoutParams(1, 0, 1f))
         detectionButton = Button(this).apply {
-            text = if (detectionRunning) "탐지 중지" else "탐지 실시"
-            textSize = 15f
+            text = if (detectionRunning) "탐지 중지" else "◉  탐지 실시"
+            textSize = 17f
             isAllCaps = false
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.BLACK)
-            background = roundedBackground(if (detectionRunning) Color.rgb(235, 65, 65) else accentColor, 16)
+            typeface = Typeface.create("sans-serif", Typeface.BOLD)
+            setTextColor(if (detectionRunning) Color.WHITE else Color.rgb(0, 20, 7))
+            setShadowLayer(if (detectionRunning) 0f else dp(8).toFloat(), 0f, 0f, Color.WHITE)
+            background = detectionButtonBackground(detectionRunning)
             setOnClickListener {
                 detectionRunning = !detectionRunning
                 if (!detectionRunning) {
@@ -2092,8 +2070,9 @@ class MainActivity : Activity(), SensorEventListener {
                 } else {
                     sensorStatusText.text = "SCANNING"
                 }
-                text = if (detectionRunning) "탐지 중지" else "탐지 실시"
-                background = roundedBackground(if (detectionRunning) Color.rgb(235, 65, 65) else accentColor, 16)
+                text = if (detectionRunning) "탐지 중지" else "◉  탐지 실시"
+                setTextColor(if (detectionRunning) Color.WHITE else Color.rgb(0, 20, 7))
+                background = detectionButtonBackground(detectionRunning)
             }
         }
         content.addView(detectionButton, LinearLayout.LayoutParams(-1, dp(54)).apply {
@@ -2146,19 +2125,47 @@ class MainActivity : Activity(), SensorEventListener {
         }
         val formatter = SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault())
         ghostWordLogs.take(8).forEach { item ->
-            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, dp(7), 0, dp(7)) }
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(9), 0, dp(9))
+            }
             val left = TextView(this).apply {
-                text = "${formatter.format(Date(item.timestamp))}  ${item.word}"
-                textSize = 12f; setTextColor(Color.WHITE)
+                text = "${formatter.format(Date(item.timestamp))}   ${item.word}"
+                textSize = 12.5f
+                setTextColor(Color.rgb(242, 248, 244))
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
             }
             val right = TextView(this).apply {
-                text = "${item.fieldValue.formatOne()} μT · ${item.level}"
-                textSize = 10f; setTextColor(accentColor); gravity = Gravity.RIGHT
+                text = "${item.fieldValue.formatOne()} μT"
+                textSize = 11f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(when (item.level) {
+                    "CRITICAL" -> Color.rgb(255, 105, 105)
+                    "HIGH" -> Color.rgb(255, 185, 80)
+                    else -> accentColor
+                })
+                gravity = Gravity.RIGHT or Gravity.CENTER_VERTICAL
+            }
+            val status = TextView(this).apply {
+                text = item.level
+                textSize = 8f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                setPadding(dp(7), dp(4), dp(7), dp(4))
+                background = GradientDrawable().apply {
+                    setColor(Color.argb(28, 255, 35, 45))
+                    cornerRadius = dp(20).toFloat()
+                    setStroke(dp(1), if (item.level == "CRITICAL") Color.rgb(190, 35, 45) else Color.rgb(130, 115, 55))
+                }
             }
             row.addView(left, LinearLayout.LayoutParams(0, -2, 1f))
-            row.addView(right)
+            row.addView(right, LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(5), 0, dp(7), 0) })
+            row.addView(status, LinearLayout.LayoutParams(-2, -2))
             container.addView(row)
-            val divider = View(this).apply { setBackgroundColor(Color.rgb(35, 60, 43)) }
+            val divider = View(this).apply { setBackgroundColor(Color.rgb(35, 65, 49)) }
             container.addView(divider, LinearLayout.LayoutParams(-1, dp(1)))
         }
     }
@@ -2677,8 +2684,29 @@ class MainActivity : Activity(), SensorEventListener {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(15), dp(14), dp(15), dp(14))
-            background = roundedBackground(Color.rgb(4, 14, 8), 16)
-            elevation = dp(2).toFloat()
+            background = neonPanelBackground()
+            elevation = dp(4).toFloat()
+        }
+    }
+
+    private fun neonPanelBackground(): GradientDrawable {
+        return GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(Color.argb(218, 5, 22, 14), Color.argb(224, 2, 10, 8), Color.argb(218, 3, 15, 10))
+        ).apply {
+            cornerRadius = dp(17).toFloat()
+            setStroke(dp(1), Color.rgb(45, 155, 88))
+        }
+    }
+
+    private fun detectionButtonBackground(active: Boolean): GradientDrawable {
+        return GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            if (active) intArrayOf(Color.rgb(170, 35, 45), Color.rgb(105, 12, 20))
+            else intArrayOf(Color.rgb(95, 255, 105), Color.rgb(35, 220, 75))
+        ).apply {
+            cornerRadius = dp(22).toFloat()
+            setStroke(dp(2), if (active) Color.rgb(255, 105, 110) else Color.rgb(125, 255, 150))
         }
     }
 
