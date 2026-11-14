@@ -1643,10 +1643,10 @@ class MainActivity : Activity(), SensorEventListener {
                     val spectrumSamples = buffer.copyOf(readCount)
 
                     processSoundEvent(dbfs)
-                    spectrumView?.setSamples(spectrumSamples, sampleRate)
 
                     runOnUiThread {
                         if (audioRunning) {
+                            spectrumView?.setSamples(spectrumSamples, sampleRate)
                             soundLevelText?.apply {
                                 text = String.format(Locale.US, "%.1f dBFS", dbfs)
                                 setTextColor(
@@ -3274,6 +3274,107 @@ class EmfLedSpectrumView(context: android.content.Context) : View(context) {
             )
         }
     }
+}
+
+
+/**
+ * 마이크 입력 파형을 표시하는 간단한 Canvas 뷰입니다.
+ * 오디오 분석 스레드에서 전달된 샘플을 화면 스레드에서 갱신합니다.
+ */
+class SoundWaveView(context: android.content.Context) : View(context) {
+    private var waveform = FloatArray(0)
+    private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(75, 255, 95)
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val centerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(35, 95, 55)
+        strokeWidth = 1f
+    }
+
+    fun setWaveform(samples: FloatArray) {
+        waveform = samples.copyOf()
+        invalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        if (width <= 0 || height <= 0) return
+        val centerY = height / 2f
+        canvas.drawLine(0f, centerY, width.toFloat(), centerY, centerPaint)
+        if (waveform.isEmpty()) return
+
+        val path = Path()
+        val count = waveform.size
+        val step = width.toFloat() / max(1, count - 1)
+        waveform.forEachIndexed { index, sample ->
+            val x = index * step
+            val y = centerY - sample.coerceIn(-1f, 1f) * height * 0.42f
+            if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+        }
+        canvas.drawPath(path, linePaint)
+    }
+}
+
+/**
+ * 입력 오디오의 간단한 대역별 에너지를 막대 형태로 표시합니다.
+ * 외부 FFT 라이브러리 없이 시간영역 샘플을 구간별 RMS로 계산합니다.
+ */
+class SpectrumView(context: android.content.Context) : View(context) {
+    private var levels = FloatArray(32)
+    private val barPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(75, 255, 95)
+        style = Paint.Style.FILL
+    }
+    private val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(17, 35, 24)
+        style = Paint.Style.FILL
+    }
+
+    fun setSamples(samples: ShortArray, sampleRate: Int) {
+        if (samples.isEmpty() || sampleRate <= 0) return
+        val next = FloatArray(levels.size)
+        val chunkSize = max(1, samples.size / next.size)
+        for (band in next.indices) {
+            val start = band * chunkSize
+            if (start >= samples.size) break
+            val end = min(samples.size, start + chunkSize)
+            var sum = 0.0
+            for (i in start until end) {
+                val normalized = samples[i].toDouble() / 32768.0
+                sum += normalized * normalized
+            }
+            val rms = sqrt(sum / max(1, end - start)).toFloat()
+            next[band] = (rms * 5f).coerceIn(0f, 1f)
+        }
+        levels = next
+        invalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        if (width <= 0 || height <= 0) return
+        val gap = max(2f, width * 0.006f)
+        val barWidth = (width - gap * (levels.size - 1)) / levels.size.toFloat()
+        levels.forEachIndexed { index, level ->
+            val left = index * (barWidth + gap)
+            val barHeight = max(dpHeight(3f), height * level)
+            val top = height - barHeight
+            canvas.drawRoundRect(
+                left, 0f, left + barWidth, height.toFloat(),
+                barWidth * 0.18f, barWidth * 0.18f, backgroundPaint
+            )
+            canvas.drawRoundRect(
+                left, top, left + barWidth, height.toFloat(),
+                barWidth * 0.18f, barWidth * 0.18f, barPaint
+            )
+        }
+    }
+
+    private fun dpHeight(value: Float): Float =
+        value * resources.displayMetrics.density
 }
 
 class RadarView(context: android.content.Context) : View(context) {
