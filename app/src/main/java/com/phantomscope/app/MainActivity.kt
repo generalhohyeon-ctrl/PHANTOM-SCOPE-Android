@@ -192,8 +192,14 @@ class MainActivity : Activity(), SensorEventListener {
         val backgroundBitmap = BitmapFactory.decodeResource(resources, R.drawable.phantom_background)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = BitmapDrawable(resources, backgroundBitmap).apply {
-                gravity = Gravity.FILL
+            // drawable-nodpi 리소스를 화면 전체에 한 번만 배치합니다.
+            // 배경 파일에는 상단 로고와 복도만 있고, 실제 버튼/패널은 아래 UI가 그립니다.
+            background = if (backgroundBitmap != null) {
+                BitmapDrawable(resources, backgroundBitmap).apply {
+                    gravity = Gravity.FILL
+                }
+            } else {
+                ColorDrawable(backgroundColor)
             }
             setPadding(dp(12), dp(4), dp(12), dp(6))
         }
@@ -2692,7 +2698,7 @@ class MainActivity : Activity(), SensorEventListener {
     private fun neonPanelBackground(): GradientDrawable {
         return GradientDrawable(
             GradientDrawable.Orientation.TOP_BOTTOM,
-            intArrayOf(Color.argb(218, 5, 22, 14), Color.argb(224, 2, 10, 8), Color.argb(218, 3, 15, 10))
+            intArrayOf(Color.argb(172, 5, 22, 14), Color.argb(184, 2, 10, 8), Color.argb(172, 3, 15, 10))
         ).apply {
             cornerRadius = dp(17).toFloat()
             setStroke(dp(1), Color.rgb(45, 155, 88))
