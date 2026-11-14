@@ -2759,7 +2759,7 @@ class MainActivity : Activity(), SensorEventListener {
         radioAttemptedIndexes.clear()
         val batchEnd = (radioBatchStart + radioBatchSize).coerceAtMost(radioStations.size)
         val batch = radioStations.subList(radioBatchStart, batchEnd).toList()
-        radioStatusView?.text = "전체 ${radioStations.size}개 중 ${radioBatchStart + 1}~$batchEnd번 방송 연결 중…"
+        radioStatusView?.text = "전체 ${radioStations.size}개 중 ${radioBatchStart + 1}~${batchEnd}번 방송 연결 중…"
         batch.forEachIndexed { localIndex, station ->
             val player = MediaPlayer()
             radioPlayers.add(player)
