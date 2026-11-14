@@ -168,6 +168,9 @@ class MainActivity : Activity(), SensorEventListener {
     private var soundWaveView: SoundWaveView? = null
     private var soundToggleButton: Button? = null
     private var lastSoundEventTime = 0L
+    private var lastMagneticChangeToneTime = 0L
+    // 66μT 단위 구간 알림: 이미 알린 최고 구간과 마지막 알림 시각을 기억합니다.
+    private var lastMagneticCueZone = -1
     private var soundEventActive = false
     private val soundEvents = mutableListOf<String>()
     private lateinit var soundPreferences: SharedPreferences
@@ -304,7 +307,7 @@ class MainActivity : Activity(), SensorEventListener {
         soundPreferences = getSharedPreferences("phantom_scope_sound_events", MODE_PRIVATE)
         settingsPreferences = getSharedPreferences("phantom_scope_settings", MODE_PRIVATE)
         radioDirectionForward = settingsPreferences?.getBoolean("radio_forward", true) ?: true
-        radioSweepMs = settingsPreferences?.getInt("radio_sweep_ms", 900)?.coerceIn(200, 5000) ?: 900
+        radioSweepMs = settingsPreferences?.getInt("radio_sweep_ms", 900)?.coerceIn(200, 1200) ?: 900
         try { detectionTone = ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 85) } catch (_: Exception) { detectionTone = null }
         val savedSensitivity = settingsPreferences?.getInt("emf_sensitivity_percent", 52) ?: 52
         anomalyTriggerThreshold = if (savedSensitivity >= 0) {
@@ -407,12 +410,14 @@ class MainActivity : Activity(), SensorEventListener {
             if (voiceBaselineSamples >= 30) {
                 voiceBaseline = voiceBaselineTotal / voiceBaselineSamples
                 voiceBaselineReady = true
+                lastMagneticCueZone = (voiceBaseline / 66f).toInt()
             }
         }
 
         if (detectionRunning) {
             // 기존 조사 기록 판정은 유지하고, 음성 출력은 기준값 대비 실제 변화량으로 별도 판정합니다.
             handleAnomaly(deviation, magnitude)
+            playMagneticChangeCue(magnitude)
             maybeShowGhostWord(magnitude)
         } else if (voiceBaselineReady) {
             // 탐지 대기 중에도 기준값을 아주 천천히 보정해 장소 변화에 적응시킵니다.
@@ -2051,10 +2056,38 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun showRadarPage() {
-        addHeading("EMF")
-        val spectrumPanel = createSpectrum()
-        content.addView(spectrumPanel, LinearLayout.LayoutParams(-1, -2).apply {
-            setMargins(0, dp(2), 0, dp(12))
+        val emfHeader = makePanel().apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+        }
+        val emfTag = TextView(this).apply {
+            text = "EMF"
+            textSize = 11f
+            typeface = Typeface.DEFAULT_BOLD
+            letterSpacing = 1f
+            setTextColor(accentColor)
+            gravity = Gravity.CENTER
+            background = roundedBackground(Color.rgb(12, 48, 29), 6)
+            setPadding(dp(9), dp(5), dp(9), dp(5))
+        }
+        val emfDescription = TextView(this).apply {
+            text = "전자기장 측정기"
+            textSize = 12f
+            setTextColor(Color.LTGRAY)
+            setPadding(dp(9), 0, 0, 0)
+        }
+        emfHeader.addView(emfTag)
+        emfHeader.addView(emfDescription)
+        content.addView(emfHeader, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(0, dp(2), 0, dp(10))
+        })
+
+        val graphPanel = makePanel()
+        graphView = FieldGraphView(this).apply { setReadings(readings.toList()) }
+        graphPanel.addView(graphView, LinearLayout.LayoutParams(-1, dp(170)))
+        content.addView(graphPanel, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(0, 0, 0, dp(12))
         })
 
         val wordPanel = makePanel().apply {
@@ -2254,6 +2287,29 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun Float.formatOne(): String = String.format(Locale.US, "%.1f", this)
+
+    private fun playMagneticChangeCue(fieldStrength: Float) {
+        // 절대 자기장 수치를 66μT 단위 구간으로 나눕니다.
+        // 더 높은 새 구간에 진입할 때만 알리고, 하락 시에는 알림 구간을 낮추지 않습니다.
+        // 알림 사이에는 최소 10초를 둡니다.
+        if (!voiceBaselineReady) return
+        val currentZone = (fieldStrength / 66f).toInt()
+        if (currentZone <= lastMagneticCueZone) return
+
+        val now = System.currentTimeMillis()
+        if (now - lastMagneticChangeToneTime < 10_000L) return
+
+        lastMagneticCueZone = currentZone
+        lastMagneticChangeToneTime = now
+        runOnUiThread {
+            try {
+                detectionTone?.startTone(ToneGenerator.TONE_PROP_BEEP, 85)
+                radioHandler.postDelayed({
+                    try { detectionTone?.startTone(ToneGenerator.TONE_PROP_BEEP, 85) } catch (_: Exception) { }
+                }, 115L)
+            } catch (_: Exception) { }
+        }
+    }
 
     private fun maybeShowGhostWord(fieldStrength: Float) {
         // 절대 자기장 기준은 20μT로 고정하고, 주변 기준값 대비 변화량으로 민감도를 판정합니다.
@@ -2573,7 +2629,7 @@ class MainActivity : Activity(), SensorEventListener {
         speedHeader.addView(speedValue)
         speedPanel.addView(speedHeader)
         val speedSeek = SeekBar(this).apply {
-            max = 4800
+            max = 1000
             progress = radioSweepMs - 200
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
@@ -2590,7 +2646,7 @@ class MainActivity : Activity(), SensorEventListener {
         }
         speedPanel.addView(speedSeek)
         speedPanel.addView(TextView(this).apply {
-            text = "200ms 빠른 전환  ·  900ms 기본  ·  5,000ms 느린 전환\n인터넷 스트림 버퍼 상태에 따라 짧은 구간은 음성이 잘릴 수 있습니다."
+            text = "200ms 빠른 전환  ·  900ms 기본  ·  1,200ms 느린 전환"
             textSize = 10.5f
             setTextColor(Color.rgb(145, 165, 150))
         })
@@ -2657,10 +2713,6 @@ class MainActivity : Activity(), SensorEventListener {
             setMargins(0, 0, 0, dp(12))
         })
 
-        addPanelText(
-            "수신 방식 및 한계",
-            "전 세계 인터넷 방송 중 7개 채널을 시작할 때 한 번만 불러옵니다. 이후에는 새로 검색하지 않고 7개 채널을 계속 순환합니다. 정지 버튼을 누르면 스왑이 멈춥니다. 엔터테인먼트용 오디오 스캔입니다."
-        )
     }
 
     private fun loadInternetRadioStations() {
@@ -2964,24 +3016,10 @@ class MainActivity : Activity(), SensorEventListener {
             })
         }
         sensitivityPanel.addView(sensitivitySeek)
-        val sensitivityHint = TextView(this).apply {
-            text = "자기장 절대 기준은 20μT로 고정됩니다. 민감도 53%에서는 기준값 대비 약 5μT 변화가 감지 기준이며, 음성 출력 확률은 약 40%입니다. 출력 후 5초 대기합니다."
-            textSize = 10.5f
-            setTextColor(Color.rgb(145, 165, 150))
-            setPadding(0, dp(5), 0, 0)
-        }
-        sensitivityPanel.addView(sensitivityHint)
         content.addView(sensitivityPanel, LinearLayout.LayoutParams(-1, -2).apply {
             setMargins(0, 0, 0, dp(12))
         })
 
-        addHeading("설정 탭 · 장비 가이드")
-        addPanelText("EMF METER · 자기장 측정기", "주변 자기장 세기를 μT 단위로 측정합니다. 전기 배선, 모터, 스피커, 자석 등도 수치에 영향을 줍니다.")
-        addPanelText("CAMERA · 영상 관측", "카메라 영상에서 인체 형태와 움직임을 분석합니다. 저조도·가림·카메라 흔들림은 오탐 또는 미탐의 원인이 될 수 있습니다.")
-        addPanelText("AUDIO / EVP · 음향 기록", "마이크로 주변 소리를 수집하고 녹음합니다. 잡음 속 음성처럼 들리는 구간은 원본 녹음으로 재확인해야 합니다.")
-        addPanelText("SPIRIT BOX · 스피릿 박스", "짧은 음성 조각이 빠르게 바뀌며 단어처럼 들릴 수 있는 ‘범블비 효과’를 활용합니다. 오락·체험용 기능이며 영적 존재와의 통신을 증명하지는 않습니다.")
-        addPanelText("RADIO SWEEP · 인터넷 방송 스캔", "7개 인터넷 라디오 스트림을 한 번 불러온 뒤 정지 버튼을 누를 때까지 순서대로 전환합니다. 실제 RF 주파수 튜닝과는 다른 방식입니다.")
-        addPanelText("DETECTION LOG · 조사 기록", "감지 시각, 자기장 변화량, 출력된 단어 및 저장된 증거 파일을 확인합니다. 기록은 앱 내부 저장소에 보관됩니다.")
 
     }
 
@@ -3499,10 +3537,10 @@ class FieldGraphView(context: android.content.Context) : View(context) {
             0f, 0f, w, h, 16f, 16f, backgroundPaint
         )
 
-        val left = 42f
+        val left = 12f
         val right = w - 12f
         val top = 20f
-        val bottom = h - 30f
+        val bottom = h - 18f
 
         // 그래프 격자
         for (i in 0..4) {
@@ -3518,7 +3556,7 @@ class FieldGraphView(context: android.content.Context) : View(context) {
         )
 
         textPaint.textAlign = Paint.Align.LEFT
-        canvas.drawText("60 SAMPLES", left, 14f, textPaint)
+        canvas.drawText("LIVE FIELD SIGNAL", left, 14f, textPaint)
 
         if (values.isEmpty()) {
             textPaint.textAlign = Paint.Align.CENTER
@@ -3534,18 +3572,6 @@ class FieldGraphView(context: android.content.Context) : View(context) {
         val minimum = (values.minOrNull() ?: 0f) - 2f
         val maximum = (values.maxOrNull() ?: 100f) + 2f
         val range = (maximum - minimum).coerceAtLeast(4f)
-
-        textPaint.textAlign = Paint.Align.RIGHT
-
-        canvas.drawText(
-            String.format(Locale.US, "%.1f", maximum),
-            left - 6f, top + 4f, textPaint
-        )
-
-        canvas.drawText(
-            String.format(Locale.US, "%.1f", minimum),
-            left - 6f, bottom, textPaint
-        )
 
         val path = Path()
 
